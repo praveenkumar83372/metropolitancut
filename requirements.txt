@@ -1,0 +1,4 @@
+python-telegram-bot[defaults]==20.7
+yt-dlp>=2025.05.01
+python-dotenv>=1.0.1
+pytubefix>=8.0.0

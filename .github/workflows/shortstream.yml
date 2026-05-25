@@ -1,0 +1,43 @@
+name: Metropolitan Shorts Live
+
+on:
+  workflow_dispatch:
+
+jobs:
+  shorts-live:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -1
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          yt-dlp --version
+
+      - name: Keep-alive ping
+        run: |
+          while true; do
+            echo "⏳ $(date '+%H:%M:%S') — bot alive..."
+            sleep 240
+          done &
+
+      - name: Run Shorts Live Bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          YOUTUBE_STREAM_URL: ${{ secrets.YOUTUBE_STREAM_URL }}
+        run: python bot_runner.py
