@@ -5,7 +5,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from shortstream import (
     cmd_stream, cmd_status, cmd_help,
     cmd_url, cmd_playlist,
-    handle_file,
+    handle_file, handle_text,
     TELEGRAM_TOKEN,
 )
 
@@ -40,6 +40,12 @@ def main():
     app.add_handler(CommandHandler("status",   cmd_status))
     app.add_handler(CommandHandler("help",     cmd_help))
 
+    # Plain text URL pasted directly in chat (must be before file handler)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_text,
+    ))
+
     # Direct file upload — no command needed
     app.add_handler(MessageHandler(
         filters.VIDEO
@@ -49,7 +55,8 @@ def main():
         handle_file,
     ))
 
-    logger.info("✅ Bot ready!")
+    logger.info("✅ Bot ready — paste a Drive link or send a file to start streaming!")
+
     app.run_polling(
         drop_pending_updates=True,
         close_loop=True,
