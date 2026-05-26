@@ -27,6 +27,8 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
+          # Always use the latest yt-dlp to stay ahead of YouTube bot detection
+          pip install -U yt-dlp
           yt-dlp --version
 
       - name: Keep-alive ping

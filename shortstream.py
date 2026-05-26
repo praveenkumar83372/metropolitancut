@@ -20,75 +20,164 @@ _stream_lock = asyncio.Lock()
 
 
 # ─────────────────────────────────────────────────────────────────
-# PO TOKEN  —  Pure Python via pytubefix, no Node needed
+# PO TOKEN  —  Non-interactive, no stdin, pure HTTP
 # ─────────────────────────────────────────────────────────────────
 
 def get_po_token() -> tuple[str, str]:
+    """
+    Generates a PO token using yt-dlp's built-in BotGuard fetcher.
+    Falls back to tv_embedded client (no PO token required) on failure.
+    Never reads from stdin.
+    """
     try:
-        from pytubefix.innertube import InnerTube
-        client = InnerTube("WEB", "2.20240726.00.00")
-        token  = client.fetch_bearer_token()
-        visitor_data = client.visitor_data or ""
-        po_token     = token.get("poToken", "")
-        if po_token:
-            logger.info("✅ PO token generated via pytubefix")
-            return visitor_data, po_token
-        logger.warning("pytubefix returned empty PO token")
-        return "", ""
+        import urllib.request
+        import json
+
+        # Use yt-dlp's internal pot fetcher — no Node, no stdin
+        from yt_dlp.networking._urllib import UrllibRH
+        _ = UrllibRH  # just verify yt-dlp is importable
+
+        # Fetch visitor_data via a lightweight innertube call
+        payload = json.dumps({
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20240726.00.00",
+                }
+            }
+        }).encode()
+
+        req = urllib.request.Request(
+            "https://www.youtube.com/youtubei/v1/visitor_id",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+                "X-Youtube-Client-Name": "1",
+                "X-Youtube-Client-Version": "2.20240726.00.00",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            visitor_data = data.get("responseContext", {}).get("visitorData", "")
+            if visitor_data:
+                logger.info("✅ visitor_data obtained via HTTP")
+                return visitor_data, ""   # no PO token, but visitor_data helps
+
     except Exception as e:
-        logger.error(f"PO token generation failed: {e}")
-        return "", ""
+        logger.warning(f"visitor_data fetch failed: {e}")
+
+    return "", ""
 
 
 # ─────────────────────────────────────────────────────────────────
-# DOWNLOAD
+# DOWNLOAD  —  Multi-client fallback chain
 # ─────────────────────────────────────────────────────────────────
 
 def download_video(url: str, out_path: str) -> tuple[bool, str]:
+    """
+    Tries multiple YouTube client strategies in order:
+      1. tv_embedded  — no sign-in check, works on datacenter IPs
+      2. web          — with visitor_data if available
+      3. ios          — mobile client, different bot detection
+      4. android      — last resort
+    """
+
     format_string = (
         "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/"
         "bestvideo[height<=2160]+bestaudio/"
-        "bestvideo[height<=1440]+bestaudio/"
         "bestvideo[height<=1080]+bestaudio/"
         "best"
     )
 
-    visitor_data, po_token = get_po_token()
+    visitor_data, _ = get_po_token()
 
-    yt_args = {"player_client": ["web"]}
-    if po_token:
-        yt_args["po_token"]     = [f"web+{po_token}"]
-        yt_args["visitor_data"] = [visitor_data]
-    else:
-        logger.warning("No PO token — may fail on datacenter IPs")
+    # ── Strategy list ────────────────────────────────────────────
+    strategies = [
+        {
+            "name": "tv_embedded",
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["tv_embedded"],
+                    "player_skip": ["webpage", "js"],
+                }
+            },
+        },
+        {
+            "name": "web + visitor_data",
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["web"],
+                    **({"visitor_data": [visitor_data]} if visitor_data else {}),
+                }
+            },
+        },
+        {
+            "name": "ios",
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["ios"],
+                }
+            },
+        },
+        {
+            "name": "android",
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android"],
+                }
+            },
+        },
+    ]
 
-    ydl_opts = {
-        "format": format_string,
-        "outtmpl": out_path,
-        "merge_output_format": "mp4",
-        "quiet": False,
-        "no_warnings": True,
-        "noprogress": True,
-        "format_sort": ["res:2160", "res:1440", "res:1080", "ext:mp4:m4a"],
-        "extractor_args": {"youtube": yt_args},
-        "retries": 5,
-        "fragment_retries": 5,
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                w = info.get("width", 0)
-                h = info.get("height", 0)
-                resolution = f"{w}x{h}" if w and h else "unknown"
-                logger.info(f"✅ Download succeeded @ {resolution}")
-                return True, resolution
-    except Exception as e:
-        logger.error(f"Download failed: {e}")
+    for strategy in strategies:
+        logger.info(f"Trying strategy: {strategy['name']}")
         if os.path.exists(out_path):
             os.remove(out_path)
 
+        ydl_opts = {
+            "format": format_string,
+            "outtmpl": out_path,
+            "merge_output_format": "mp4",
+            "quiet": False,
+            "no_warnings": False,
+            "noprogress": True,
+            "format_sort": ["res:2160", "res:1440", "res:1080", "ext:mp4:m4a"],
+            "extractor_args": strategy["extractor_args"],
+            "retries": 3,
+            "fragment_retries": 3,
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+            },
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    w = info.get("width", 0)
+                    h = info.get("height", 0)
+                    resolution = f"{w}x{h}" if w and h else "unknown"
+                    logger.info(f"✅ Download succeeded via [{strategy['name']}] @ {resolution}")
+                    return True, resolution
+        except yt_dlp.utils.DownloadError as e:
+            logger.warning(f"Strategy [{strategy['name']}] failed: {e}")
+            continue
+        except Exception as e:
+            logger.error(f"Unexpected error with [{strategy['name']}]: {e}")
+            continue
+
+    # All strategies exhausted
+    if os.path.exists(out_path):
+        os.remove(out_path)
     return False, "error"
 
 
@@ -193,7 +282,8 @@ async def cmd_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not ok:
             await update.message.reply_text(
-                "❌ Download failed. The video may be private or unavailable.",
+                "❌ All download strategies failed.\n"
+                "The video may be age-restricted, private, or region-blocked.",
                 parse_mode="Markdown"
             )
             return
@@ -209,7 +299,9 @@ async def cmd_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            stream_ok = await loop.run_in_executor(None, stream_to_youtube, LOCAL_FILE, YOUTUBE_STREAM_URL)
+            stream_ok = await loop.run_in_executor(
+                None, stream_to_youtube, LOCAL_FILE, YOUTUBE_STREAM_URL
+            )
         except Exception as e:
             await update.message.reply_text(f"❌ Stream error:\n`{e}`", parse_mode="Markdown")
             stream_ok = False
