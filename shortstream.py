@@ -12,30 +12,21 @@ load_dotenv()
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN")
 YOUTUBE_STREAM_URL = os.getenv("YOUTUBE_STREAM_URL")
 
+# Optional: residential proxy to bypass datacenter IP blocks
+# Set in GitHub Secrets as:  PROXY_URL=http://user:pass@host:port
+# Free option: use webshare.io free tier (10 residential proxies)
+# or any socks5/http residential proxy
+PROXY_URL = os.getenv("PROXY_URL", "")
+
 LOCAL_FILE = "walking_tour.mp4"
 
 logger = logging.getLogger(__name__)
-
 _stream_lock = asyncio.Lock()
 
 
 # ─────────────────────────────────────────────────────────────────
-# DOWNLOAD  —  Ordered by datacenter-IP friendliness
+# DOWNLOAD  —  Proxy + client fallback chain
 # ─────────────────────────────────────────────────────────────────
-#
-# Why these clients work on GitHub Actions (Azure datacenter IPs):
-#
-#   android_vr  → REQUIRE_JS_PLAYER=False, NO GVS PO token policy
-#                 (Oculus Quest user-agent, YouTube doesn't bot-check VR)
-#
-#   tv          → NO GVS PO token policy at all (TVHTML5 Cobalt UA)
-#                 YouTube treats smart-TV clients differently
-#
-#   web_embedded → thirdParty embedUrl set to reddit.com, no REQUIRE_AUTH,
-#                  no GVS PO token policy — bypasses sign-in check
-#
-#   ios / android → fallback; they DO require PO token for GVS but
-#                   yt-dlp will still attempt delivery without one
 
 def download_video(url: str, out_path: str) -> tuple[bool, str]:
     format_string = (
@@ -45,75 +36,62 @@ def download_video(url: str, out_path: str) -> tuple[bool, str]:
         "best"
     )
 
-    strategies = [
-        # ── Best bet on datacenter: no JS player + no PO token needed ──
-        {
-            "name": "android_vr",
-            "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
-        },
-        # ── TV client: no PO token policy, Cobalt UA ─────────────────
-        {
-            "name": "tv",
-            "extractor_args": {"youtube": {"player_client": ["tv"]}},
-        },
-        # ── Embedded web: reddit embedUrl, no sign-in check ──────────
-        {
-            "name": "web_embedded",
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["web_embedded"],
-                    "player_skip": ["configs"],
-                }
-            },
-        },
-        # ── iOS mobile: different bot rules ──────────────────────────
-        {
-            "name": "ios",
-            "extractor_args": {"youtube": {"player_client": ["ios"]}},
-        },
-        # ── Android: last resort ─────────────────────────────────────
-        {
-            "name": "android",
-            "extractor_args": {"youtube": {"player_client": ["android"]}},
-        },
-    ]
+    # All clients to try — on a residential IP any of these work;
+    # android_vr first because it skips JS player entirely
+    clients = ["android_vr", "tv", "web_embedded", "ios", "android", "web"]
 
-    for strategy in strategies:
-        logger.info(f"Trying client: [{strategy['name']}]")
-        if os.path.exists(out_path):
-            os.remove(out_path)
+    # Build proxy-aware option sets:
+    #   Pass 1  — with proxy (if configured)
+    #   Pass 2  — without proxy (fallback, in case proxy itself fails)
+    proxy_passes = []
+    if PROXY_URL:
+        proxy_passes.append(("with proxy", PROXY_URL))
+    proxy_passes.append(("no proxy", None))
 
-        ydl_opts = {
-            "format": format_string,
-            "outtmpl": out_path,
-            "merge_output_format": "mp4",
-            "quiet": False,
-            "no_warnings": False,
-            "noprogress": True,
-            "extractor_args": strategy["extractor_args"],
-            "retries": 3,
-            "fragment_retries": 3,
-            # Suppress "Sign in to confirm" error — let next strategy try
-            "ignoreerrors": False,
-        }
+    for pass_label, proxy in proxy_passes:
+        for client in clients:
+            label = f"{client} / {pass_label}"
+            logger.info(f"Trying: [{label}]")
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if info and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                    w = info.get("width", 0)
-                    h = info.get("height", 0)
-                    resolution = f"{w}x{h}" if w and h else "unknown"
-                    logger.info(
-                        f"✅ Download succeeded via [{strategy['name']}] @ {resolution}"
-                    )
-                    return True, resolution
-        except yt_dlp.utils.DownloadError as e:
-            logger.warning(f"[{strategy['name']}] failed: {e}")
-            continue
-        except Exception as e:
-            logger.error(f"[{strategy['name']}] unexpected error: {e}")
-            continue
+            if os.path.exists(out_path):
+                os.remove(out_path)
+
+            ydl_opts = {
+                "format": format_string,
+                "outtmpl": out_path,
+                "merge_output_format": "mp4",
+                "quiet": False,
+                "no_warnings": False,
+                "noprogress": True,
+                "extractor_args": {
+                    "youtube": {"player_client": [client]}
+                },
+                "retries": 3,
+                "fragment_retries": 3,
+            }
+
+            if proxy:
+                ydl_opts["proxy"] = proxy
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if (
+                        info
+                        and os.path.exists(out_path)
+                        and os.path.getsize(out_path) > 0
+                    ):
+                        w = info.get("width", 0)
+                        h = info.get("height", 0)
+                        resolution = f"{w}x{h}" if w and h else "unknown"
+                        logger.info(f"✅ Success [{label}] @ {resolution}")
+                        return True, resolution
+            except yt_dlp.utils.DownloadError as e:
+                logger.warning(f"[{label}] failed: {e}")
+                continue
+            except Exception as e:
+                logger.error(f"[{label}] unexpected error: {e}")
+                continue
 
     if os.path.exists(out_path):
         os.remove(out_path)
@@ -126,26 +104,14 @@ def download_video(url: str, out_path: str) -> tuple[bool, str]:
 
 def stream_to_youtube(file_path: str, rtmp_destination: str) -> bool:
     ffmpeg_cmd = [
-        "ffmpeg",
-        "-re",
-        "-i", file_path,
+        "ffmpeg", "-re", "-i", file_path,
         "-vf", "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920",
-        "-c:v", "libx264",
-        "-preset", "slow",
-        "-b:v", "8000k",
-        "-maxrate", "9000k",
-        "-bufsize", "18000k",
-        "-pix_fmt", "yuv420p",
-        "-g", "60",
-        "-keyint_min", "60",
-        "-sc_threshold", "0",
-        "-r", "30",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-ar", "48000",
-        "-ac", "2",
-        "-f", "flv",
-        rtmp_destination,
+        "-c:v", "libx264", "-preset", "slow",
+        "-b:v", "8000k", "-maxrate", "9000k", "-bufsize", "18000k",
+        "-pix_fmt", "yuv420p", "-g", "60", "-keyint_min", "60",
+        "-sc_threshold", "0", "-r", "30",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+        "-f", "flv", rtmp_destination,
     ]
     logger.info("FFmpeg streaming started...")
     result = subprocess.run(ffmpeg_cmd)
@@ -160,12 +126,9 @@ def get_video_info(file_path: str) -> dict:
     info = {"duration": "unknown", "size": "unknown", "resolution": "unknown"}
     try:
         r = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration:stream=width,height",
-                "-of", "default=noprint_wrappers=1",
-                file_path,
-            ],
+            ["ffprobe", "-v", "error",
+             "-show_entries", "format=duration:stream=width,height",
+             "-of", "default=noprint_wrappers=1", file_path],
             capture_output=True, text=True, timeout=15,
         )
         for line in r.stdout.splitlines():
@@ -210,8 +173,10 @@ async def cmd_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with _stream_lock:
         loop = asyncio.get_event_loop()
+
+        proxy_note = f"\n🔀 Proxy: `{PROXY_URL.split('@')[-1]}`" if PROXY_URL else "\n⚠️ No proxy set"
         await update.message.reply_text(
-            f"📥 *Downloading video...*\n\n`{video_url}`",
+            f"📥 *Downloading video...*\n\n`{video_url}`{proxy_note}",
             parse_mode="Markdown",
         )
 
@@ -226,21 +191,25 @@ async def cmd_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if not ok:
+            tip = (
+                "💡 Add a `PROXY_URL` secret (residential proxy) to bypass YouTube's datacenter IP block."
+                if not PROXY_URL
+                else "💡 The proxy may be blocked too — try a different residential proxy."
+            )
             await update.message.reply_text(
-                "❌ All download strategies failed.\n"
-                "The video may be private, age-restricted, or region-blocked.",
+                f"❌ All download strategies failed.\n\n{tip}",
                 parse_mode="Markdown",
             )
             return
 
         vinfo = get_video_info(LOCAL_FILE)
         await update.message.reply_text(
-            f"🎬 *Download complete! Going LIVE...*\n\n"
+            f"🎬 *Download complete\\! Going LIVE\\.\\.\\.*\n\n"
             f"📐 Source: `{source_res}`\n"
-            f"📐 Output: `1080×1920` (9:16 vertical)\n"
+            f"📐 Output: `1080×1920` \\(9:16 vertical\\)\n"
             f"⏱ Duration: `{vinfo['duration']}`\n"
             f"💾 Size: `{vinfo['size']}`",
-            parse_mode="Markdown",
+            parse_mode="MarkdownV2",
         )
 
         try:
@@ -267,10 +236,8 @@ async def cmd_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _stream_lock.locked():
-        await update.message.reply_text("🔴 *Stream is currently LIVE.*", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("⚪ *No stream running.*", parse_mode="Markdown")
+    status = "🔴 *Stream is currently LIVE.*" if _stream_lock.locked() else "⚪ *No stream running.*"
+    await update.message.reply_text(status, parse_mode="Markdown")
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
