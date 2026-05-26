@@ -27,7 +27,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          # Always use the latest yt-dlp to stay ahead of YouTube bot detection
+          # Always pull latest yt-dlp — client signatures change weekly
           pip install -U yt-dlp
           yt-dlp --version
 

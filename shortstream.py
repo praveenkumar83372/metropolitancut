@@ -20,73 +20,24 @@ _stream_lock = asyncio.Lock()
 
 
 # ─────────────────────────────────────────────────────────────────
-# PO TOKEN  —  Non-interactive, no stdin, pure HTTP
+# DOWNLOAD  —  Ordered by datacenter-IP friendliness
 # ─────────────────────────────────────────────────────────────────
-
-def get_po_token() -> tuple[str, str]:
-    """
-    Generates a PO token using yt-dlp's built-in BotGuard fetcher.
-    Falls back to tv_embedded client (no PO token required) on failure.
-    Never reads from stdin.
-    """
-    try:
-        import urllib.request
-        import json
-
-        # Use yt-dlp's internal pot fetcher — no Node, no stdin
-        from yt_dlp.networking._urllib import UrllibRH
-        _ = UrllibRH  # just verify yt-dlp is importable
-
-        # Fetch visitor_data via a lightweight innertube call
-        payload = json.dumps({
-            "context": {
-                "client": {
-                    "clientName": "WEB",
-                    "clientVersion": "2.20240726.00.00",
-                }
-            }
-        }).encode()
-
-        req = urllib.request.Request(
-            "https://www.youtube.com/youtubei/v1/visitor_id",
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
-                ),
-                "X-Youtube-Client-Name": "1",
-                "X-Youtube-Client-Version": "2.20240726.00.00",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-            visitor_data = data.get("responseContext", {}).get("visitorData", "")
-            if visitor_data:
-                logger.info("✅ visitor_data obtained via HTTP")
-                return visitor_data, ""   # no PO token, but visitor_data helps
-
-    except Exception as e:
-        logger.warning(f"visitor_data fetch failed: {e}")
-
-    return "", ""
-
-
-# ─────────────────────────────────────────────────────────────────
-# DOWNLOAD  —  Multi-client fallback chain
-# ─────────────────────────────────────────────────────────────────
+#
+# Why these clients work on GitHub Actions (Azure datacenter IPs):
+#
+#   android_vr  → REQUIRE_JS_PLAYER=False, NO GVS PO token policy
+#                 (Oculus Quest user-agent, YouTube doesn't bot-check VR)
+#
+#   tv          → NO GVS PO token policy at all (TVHTML5 Cobalt UA)
+#                 YouTube treats smart-TV clients differently
+#
+#   web_embedded → thirdParty embedUrl set to reddit.com, no REQUIRE_AUTH,
+#                  no GVS PO token policy — bypasses sign-in check
+#
+#   ios / android → fallback; they DO require PO token for GVS but
+#                   yt-dlp will still attempt delivery without one
 
 def download_video(url: str, out_path: str) -> tuple[bool, str]:
-    """
-    Tries multiple YouTube client strategies in order:
-      1. tv_embedded  — no sign-in check, works on datacenter IPs
-      2. web          — with visitor_data if available
-      3. ios          — mobile client, different bot detection
-      4. android      — last resort
-    """
-
     format_string = (
         "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/"
         "bestvideo[height<=2160]+bestaudio/"
@@ -94,48 +45,41 @@ def download_video(url: str, out_path: str) -> tuple[bool, str]:
         "best"
     )
 
-    visitor_data, _ = get_po_token()
-
-    # ── Strategy list ────────────────────────────────────────────
     strategies = [
+        # ── Best bet on datacenter: no JS player + no PO token needed ──
         {
-            "name": "tv_embedded",
+            "name": "android_vr",
+            "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
+        },
+        # ── TV client: no PO token policy, Cobalt UA ─────────────────
+        {
+            "name": "tv",
+            "extractor_args": {"youtube": {"player_client": ["tv"]}},
+        },
+        # ── Embedded web: reddit embedUrl, no sign-in check ──────────
+        {
+            "name": "web_embedded",
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["tv_embedded"],
-                    "player_skip": ["webpage", "js"],
+                    "player_client": ["web_embedded"],
+                    "player_skip": ["configs"],
                 }
             },
         },
-        {
-            "name": "web + visitor_data",
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["web"],
-                    **({"visitor_data": [visitor_data]} if visitor_data else {}),
-                }
-            },
-        },
+        # ── iOS mobile: different bot rules ──────────────────────────
         {
             "name": "ios",
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["ios"],
-                }
-            },
+            "extractor_args": {"youtube": {"player_client": ["ios"]}},
         },
+        # ── Android: last resort ─────────────────────────────────────
         {
             "name": "android",
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android"],
-                }
-            },
+            "extractor_args": {"youtube": {"player_client": ["android"]}},
         },
     ]
 
     for strategy in strategies:
-        logger.info(f"Trying strategy: {strategy['name']}")
+        logger.info(f"Trying client: [{strategy['name']}]")
         if os.path.exists(out_path):
             os.remove(out_path)
 
@@ -146,17 +90,11 @@ def download_video(url: str, out_path: str) -> tuple[bool, str]:
             "quiet": False,
             "no_warnings": False,
             "noprogress": True,
-            "format_sort": ["res:2160", "res:1440", "res:1080", "ext:mp4:m4a"],
             "extractor_args": strategy["extractor_args"],
             "retries": 3,
             "fragment_retries": 3,
-            "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
-                ),
-            },
+            # Suppress "Sign in to confirm" error — let next strategy try
+            "ignoreerrors": False,
         }
 
         try:
@@ -166,16 +104,17 @@ def download_video(url: str, out_path: str) -> tuple[bool, str]:
                     w = info.get("width", 0)
                     h = info.get("height", 0)
                     resolution = f"{w}x{h}" if w and h else "unknown"
-                    logger.info(f"✅ Download succeeded via [{strategy['name']}] @ {resolution}")
+                    logger.info(
+                        f"✅ Download succeeded via [{strategy['name']}] @ {resolution}"
+                    )
                     return True, resolution
         except yt_dlp.utils.DownloadError as e:
-            logger.warning(f"Strategy [{strategy['name']}] failed: {e}")
+            logger.warning(f"[{strategy['name']}] failed: {e}")
             continue
         except Exception as e:
-            logger.error(f"Unexpected error with [{strategy['name']}]: {e}")
+            logger.error(f"[{strategy['name']}] unexpected error: {e}")
             continue
 
-    # All strategies exhausted
     if os.path.exists(out_path):
         os.remove(out_path)
     return False, "error"
@@ -225,9 +164,9 @@ def get_video_info(file_path: str) -> dict:
                 "ffprobe", "-v", "error",
                 "-show_entries", "format=duration:stream=width,height",
                 "-of", "default=noprint_wrappers=1",
-                file_path
+                file_path,
             ],
-            capture_output=True, text=True, timeout=15
+            capture_output=True, text=True, timeout=15,
         )
         for line in r.stdout.splitlines():
             if line.startswith("duration="):
@@ -254,7 +193,9 @@ def get_video_info(file_path: str) -> dict:
 
 async def cmd_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ No URL provided.\nUsage: /stream <youtube_url>")
+        await update.message.reply_text(
+            "❌ No URL provided.\nUsage: /stream <youtube_url>"
+        )
         return
 
     if not YOUTUBE_STREAM_URL:
@@ -271,20 +212,24 @@ async def cmd_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_event_loop()
         await update.message.reply_text(
             f"📥 *Downloading video...*\n\n`{video_url}`",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
 
         try:
-            ok, source_res = await loop.run_in_executor(None, download_video, video_url, LOCAL_FILE)
+            ok, source_res = await loop.run_in_executor(
+                None, download_video, video_url, LOCAL_FILE
+            )
         except Exception as e:
-            await update.message.reply_text(f"❌ Download failed:\n`{e}`", parse_mode="Markdown")
+            await update.message.reply_text(
+                f"❌ Download failed:\n`{e}`", parse_mode="Markdown"
+            )
             return
 
         if not ok:
             await update.message.reply_text(
                 "❌ All download strategies failed.\n"
-                "The video may be age-restricted, private, or region-blocked.",
-                parse_mode="Markdown"
+                "The video may be private, age-restricted, or region-blocked.",
+                parse_mode="Markdown",
             )
             return
 
@@ -295,7 +240,7 @@ async def cmd_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📐 Output: `1080×1920` (9:16 vertical)\n"
             f"⏱ Duration: `{vinfo['duration']}`\n"
             f"💾 Size: `{vinfo['size']}`",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
 
         try:
@@ -303,16 +248,22 @@ async def cmd_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 None, stream_to_youtube, LOCAL_FILE, YOUTUBE_STREAM_URL
             )
         except Exception as e:
-            await update.message.reply_text(f"❌ Stream error:\n`{e}`", parse_mode="Markdown")
+            await update.message.reply_text(
+                f"❌ Stream error:\n`{e}`", parse_mode="Markdown"
+            )
             stream_ok = False
         finally:
             if os.path.exists(LOCAL_FILE):
                 os.remove(LOCAL_FILE)
 
         if stream_ok:
-            await update.message.reply_text("✅ *Stream ended naturally.*", parse_mode="Markdown")
+            await update.message.reply_text(
+                "✅ *Stream ended naturally.*", parse_mode="Markdown"
+            )
         else:
-            await update.message.reply_text("⚠️ *Stream ended with an error.*", parse_mode="Markdown")
+            await update.message.reply_text(
+                "⚠️ *Stream ended with an error.*", parse_mode="Markdown"
+            )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -328,5 +279,5 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stream `<url>` — Download & Go Live\n"
         "/status — Check if stream is running\n"
         "/help — Show this message",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
