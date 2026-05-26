@@ -133,23 +133,21 @@ async def _download_url(url: str, dest: str, message: Message) -> bool:
         if not file_id:
             await message.reply_text("❌ Could not extract Google Drive file ID from the link.")
             return False
-        download_url = f"https://drive.google.com/uc?id={file_id}"
+        gdrive_url = f"https://drive.google.com/uc?id={file_id}"
     else:
-        download_url = url
+        gdrive_url = None
 
     loop = asyncio.get_event_loop()
 
     def _dl():
         if is_gdrive:
             result = subprocess.run(
-                ["gdown", "--fuzzy", "-O", dest, download_url],
+                ["gdown", gdrive_url, "-O", dest],
                 capture_output=True, text=True,
             )
             return result.returncode == 0, result.stderr + result.stdout
         else:
-            req = urllib.request.Request(
-                download_url, headers={"User-Agent": "Mozilla/5.0"}
-            )
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=300) as resp, \
                  open(dest, "wb") as out:
                 while True:
@@ -178,7 +176,7 @@ async def _download_url(url: str, dest: str, message: Message) -> bool:
                 os.remove(dest)
                 await message.reply_text(
                     "❌ *Google Drive returned an HTML page instead of the video.*\n\n"
-                    "This means Google is blocking the download from this server.\n\n"
+                    "Google is blocking the download from this server.\n\n"
                     "Alternative: download the video to your phone and send the file directly here.",
                     parse_mode="Markdown",
                 )
