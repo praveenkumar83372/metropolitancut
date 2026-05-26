@@ -27,8 +27,6 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install -U yt-dlp
-          yt-dlp --version
 
       - name: Keep-alive ping
         run: |

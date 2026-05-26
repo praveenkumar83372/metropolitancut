@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import logging
 import asyncio
@@ -15,6 +16,40 @@ LOCAL_FILE = "stream_input.mp4"
 
 logger = logging.getLogger(__name__)
 _stream_lock = asyncio.Lock()
+
+# In-memory playlist: list of {"url": str, "label": str}
+_playlist: list[dict] = []
+
+
+# ─────────────────────────────────────────────────────────────────
+# GOOGLE DRIVE  —  convert share URL → direct download URL
+# ─────────────────────────────────────────────────────────────────
+
+def extract_gdrive_id(url: str) -> str | None:
+    """Extract file ID from any Google Drive share URL format."""
+    patterns = [
+        r"/file/d/([a-zA-Z0-9_-]{25,})",   # /file/d/ID/view
+        r"id=([a-zA-Z0-9_-]{25,})",          # ?id=ID
+        r"/d/([a-zA-Z0-9_-]{25,})",          # short /d/ID
+    ]
+    for pat in patterns:
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def make_gdrive_direct(url: str) -> str | None:
+    """
+    Convert a Google Drive share link to a direct download URL.
+    Returns None if the URL is not a Google Drive link.
+    """
+    if "drive.google.com" not in url and "docs.google.com" not in url:
+        return None
+    file_id = extract_gdrive_id(url)
+    if not file_id:
+        return None
+    return f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -74,7 +109,6 @@ def get_video_info(file_path: str) -> dict:
 
 
 def is_valid_video(file_path: str) -> bool:
-    """Check ffprobe can actually read the file as video/audio."""
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
@@ -86,11 +120,52 @@ def is_valid_video(file_path: str) -> bool:
         return False
 
 
+async def _download_url(url: str, dest: str, message: Message) -> bool:
+    """
+    Download from a URL to dest.
+    Handles Google Drive share links automatically.
+    Returns True on success.
+    """
+    import urllib.request
+
+    # Convert Google Drive share link → direct download
+    gdrive_direct = make_gdrive_direct(url)
+    if gdrive_direct:
+        await message.reply_text(
+            "☁️ *Google Drive link detected — converting to direct download...*",
+            parse_mode="Markdown",
+        )
+        download_url = gdrive_direct
+    else:
+        download_url = url
+
+    loop = asyncio.get_event_loop()
+
+    def _dl(u, d):
+        req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=300) as resp, open(d, "wb") as out:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+
+    try:
+        await loop.run_in_executor(None, _dl, download_url, dest)
+        return True
+    except Exception as e:
+        await message.reply_text(
+            f"❌ Download failed:\n`{e}`\n\n"
+            "For Google Drive: make sure the file is shared as *'Anyone with the link'*.",
+            parse_mode="Markdown",
+        )
+        return False
+
+
 async def _do_stream(message: Message, file_path: str):
     """Core streaming logic shared by all upload paths."""
     loop = asyncio.get_event_loop()
 
-    # Validate the file is actually a real media file
     if not is_valid_video(file_path):
         await message.reply_text(
             "❌ File doesn't appear to be a valid video/audio file.\n"
@@ -170,8 +245,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_size_mb = getattr(tg_file, "file_size", 0) / (1024 * 1024)
     file_name = getattr(tg_file, "file_name", "uploaded file")
 
-    # Telegram bot API hard limit is 20 MB download via getFile
-    # For larger files users must upload as a document or use /url
     if file_size_mb > 2000:
         await msg.reply_text(
             f"❌ File too large ({file_size_mb:.0f} MB).\n"
@@ -201,7 +274,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"❌ Download from Telegram failed:\n`{e}`", parse_mode="Markdown")
             return
 
-        # Wrap audio-only files with a black video track
         if is_audio_only:
             await msg.reply_text("🎵 Audio detected — adding black background for stream...")
             wrapped = LOCAL_FILE + "_wrapped.mp4"
@@ -229,11 +301,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────
-# /url command  —  direct download link for large files
+# /url  —  stream a single URL (Google Drive or direct link)
 # ─────────────────────────────────────────────────────────────────
 
 async def cmd_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Download from a direct URL (Dropbox, own server, Google Drive direct link)."""
     if not YOUTUBE_STREAM_URL:
         await update.message.reply_text("❌ YOUTUBE_STREAM_URL secret is missing.")
         return
@@ -244,27 +315,23 @@ async def cmd_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args:
         await update.message.reply_text(
-            "Usage: `/url <direct_download_link>`\n\n"
-            "Examples:\n"
-            "• Dropbox: change `?dl=0` → `?dl=1` at end of URL\n"
-            "• Google Drive: `https://drive.google.com/uc?export=download&id=FILE_ID`\n"
-            "• Your server: `https://yourserver.com/video.mp4`\n\n"
-            "⚠️ YouTube links won't work here — upload the file directly instead.",
+            "Usage: `/url <link>`\n\n"
+            "Supported links:\n"
+            "• *Google Drive* share link (file must be shared as 'Anyone with link')\n"
+            "• *Dropbox*: change `?dl=0` → `?dl=1`\n"
+            "• *Your server*: `https://yourserver.com/video.mp4`\n\n"
+            "⚠️ YouTube links won't work — upload the file directly instead.",
             parse_mode="Markdown",
         )
         return
 
     raw_url = context.args[0]
 
-    # Block YouTube URLs explicitly
     blocked = ("youtube.com", "youtu.be", "youtube-nocookie.com")
     if any(b in raw_url for b in blocked):
         await update.message.reply_text(
-            "❌ YouTube URLs are not supported — YouTube blocks downloads from server IPs.\n\n"
-            "Instead:\n"
-            "1. Download the video on your phone/PC\n"
-            "2. Send the file directly to this bot\n"
-            "3. Or upload to Dropbox/Drive and send that link with `/url`"
+            "❌ YouTube URLs are not supported.\n\n"
+            "Download the video first, then send it here or upload to Google Drive."
         )
         return
 
@@ -273,39 +340,16 @@ async def cmd_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with _stream_lock:
-        loop = asyncio.get_event_loop()
-
         await update.message.reply_text(
-            f"📥 *Downloading from URL...*\n\n`{raw_url}`",
+            f"📥 *Downloading...*\n\n`{raw_url}`",
             parse_mode="Markdown",
         )
 
         if os.path.exists(LOCAL_FILE):
             os.remove(LOCAL_FILE)
 
-        try:
-            import urllib.request
-
-            def _dl(url, dest):
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": "Mozilla/5.0"}
-                )
-                with urllib.request.urlopen(req, timeout=300) as resp, \
-                     open(dest, "wb") as out:
-                    while True:
-                        chunk = resp.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-
-            await loop.run_in_executor(None, _dl, raw_url, LOCAL_FILE)
-
-        except Exception as e:
-            await update.message.reply_text(
-                f"❌ Download failed:\n`{e}`\n\n"
-                "Make sure the URL is a *direct* download link, not a preview page.",
-                parse_mode="Markdown",
-            )
+        ok = await _download_url(raw_url, LOCAL_FILE, update.message)
+        if not ok:
             return
 
         if not os.path.exists(LOCAL_FILE) or os.path.getsize(LOCAL_FILE) == 0:
@@ -316,38 +360,189 @@ async def cmd_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────
-# /stream  —  now just explains the correct usage
+# /playlist  —  manage a queue of URLs to stream one by one
+# ─────────────────────────────────────────────────────────────────
+
+async def cmd_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /playlist                  → show current playlist
+    /playlist add <url>        → add URL to playlist
+    /playlist remove <number>  → remove item by number
+    /playlist clear            → clear all
+    /playlist start            → stream all items in order
+    """
+    global _playlist
+    args = context.args
+
+    # ── show playlist ──────────────────────────────────────────
+    if not args:
+        if not _playlist:
+            await update.message.reply_text(
+                "📋 *Playlist is empty.*\n\n"
+                "Add videos with:\n`/playlist add <Google Drive or direct URL>`",
+                parse_mode="Markdown",
+            )
+            return
+        lines = [f"📋 *Playlist ({len(_playlist)} items):*\n"]
+        for i, item in enumerate(_playlist, 1):
+            lines.append(f"{i}. {item['label']}")
+        lines.append("\nUse `/playlist start` to stream all in order.")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    sub = args[0].lower()
+
+    # ── add ───────────────────────────────────────────────────
+    if sub == "add":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: `/playlist add <url>`", parse_mode="Markdown")
+            return
+        url = args[1]
+        if not url.startswith(("http://", "https://")):
+            await update.message.reply_text("❌ Invalid URL.")
+            return
+        blocked = ("youtube.com", "youtu.be")
+        if any(b in url for b in blocked):
+            await update.message.reply_text("❌ YouTube URLs are not supported.")
+            return
+        # Use short label: Drive ID or last path segment
+        gdrive_id = extract_gdrive_id(url)
+        label = f"Drive:{gdrive_id[:12]}…" if gdrive_id else url[:60]
+        _playlist.append({"url": url, "label": label})
+        await update.message.reply_text(
+            f"✅ Added to playlist (#{len(_playlist)}):\n`{label}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── remove ────────────────────────────────────────────────
+    if sub == "remove":
+        if len(args) < 2 or not args[1].isdigit():
+            await update.message.reply_text("Usage: `/playlist remove <number>`", parse_mode="Markdown")
+            return
+        idx = int(args[1]) - 1
+        if idx < 0 or idx >= len(_playlist):
+            await update.message.reply_text("❌ Invalid item number.")
+            return
+        removed = _playlist.pop(idx)
+        await update.message.reply_text(f"🗑 Removed: `{removed['label']}`", parse_mode="Markdown")
+        return
+
+    # ── clear ─────────────────────────────────────────────────
+    if sub == "clear":
+        _playlist.clear()
+        await update.message.reply_text("🗑 Playlist cleared.")
+        return
+
+    # ── start ─────────────────────────────────────────────────
+    if sub == "start":
+        if not YOUTUBE_STREAM_URL:
+            await update.message.reply_text("❌ YOUTUBE_STREAM_URL secret is missing.")
+            return
+        if _stream_lock.locked():
+            await update.message.reply_text("⚠️ A stream is already LIVE right now.")
+            return
+        if not _playlist:
+            await update.message.reply_text("📋 Playlist is empty. Add URLs first.")
+            return
+
+        total = len(_playlist)
+        await update.message.reply_text(
+            f"▶️ *Starting playlist — {total} video(s)...*",
+            parse_mode="Markdown",
+        )
+
+        async with _stream_lock:
+            items = list(_playlist)   # snapshot
+            for i, item in enumerate(items, 1):
+                await update.message.reply_text(
+                    f"🎬 *Playing {i}/{total}:*\n`{item['label']}`",
+                    parse_mode="Markdown",
+                )
+
+                if os.path.exists(LOCAL_FILE):
+                    os.remove(LOCAL_FILE)
+
+                ok = await _download_url(item["url"], LOCAL_FILE, update.message)
+                if not ok:
+                    await update.message.reply_text(
+                        f"⏭ Skipping item {i} due to download error.", parse_mode="Markdown"
+                    )
+                    continue
+
+                if not os.path.exists(LOCAL_FILE) or os.path.getsize(LOCAL_FILE) == 0:
+                    await update.message.reply_text(f"⏭ Skipping item {i} — empty file.")
+                    continue
+
+                await _do_stream(update.message, LOCAL_FILE)
+
+            await update.message.reply_text(
+                f"✅ *Playlist finished! All {total} video(s) streamed.*",
+                parse_mode="Markdown",
+            )
+        return
+
+    # ── unknown subcommand ─────────────────────────────────────
+    await update.message.reply_text(
+        "Unknown subcommand.\n\n"
+        "Usage:\n"
+        "`/playlist` — show list\n"
+        "`/playlist add <url>` — add video\n"
+        "`/playlist remove <n>` — remove item\n"
+        "`/playlist clear` — clear all\n"
+        "`/playlist start` — stream all",
+        parse_mode="Markdown",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+# /stream  —  usage guide
 # ─────────────────────────────────────────────────────────────────
 
 async def cmd_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *How to stream:*\n\n"
-        "🎬 *Upload a file* — just send a video/audio file directly in this chat. No command needed.\n\n"
-        "🔗 *Large file via URL* — use:\n"
-        "`/url <direct_download_link>`\n"
-        "_(Dropbox, Google Drive direct, your own server)_\n\n"
-        "❌ YouTube links won't work — YouTube blocks server IPs.\n"
-        "Download the video first, then send it here.",
+        "🎬 *Single video from Google Drive:*\n"
+        "`/url <Google Drive share link>`\n"
+        "_(Share the file as 'Anyone with the link' first)_\n\n"
+        "📋 *Playlist (multiple videos):*\n"
+        "`/playlist add <url>` — add videos one by one\n"
+        "`/playlist` — view the queue\n"
+        "`/playlist start` — stream them all in order\n\n"
+        "📁 *Upload directly:*\n"
+        "Just send a video/audio file here — no command needed.\n\n"
+        "❌ YouTube links won't work — download first.",
         parse_mode="Markdown",
     )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = "🔴 *Stream is currently LIVE.*" if _stream_lock.locked() else "⚪ *No stream running.*"
+    if _stream_lock.locked():
+        status = "🔴 *Stream is currently LIVE.*"
+    else:
+        pl_count = len(_playlist)
+        status = f"⚪ *No stream running.*"
+        if pl_count:
+            status += f"\n📋 Playlist has {pl_count} item(s) queued."
     await update.message.reply_text(status, parse_mode="Markdown")
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎥 *Metropolitan Shorts Live Bot*\n\n"
-        "*To stream:*\n"
-        "Just send a video or audio file here — no command needed!\n\n"
-        "*For large files (>2 GB):*\n"
-        "`/url <direct_link>` — Dropbox, Drive, your server\n\n"
-        "*Commands:*\n"
-        "/status — Is a stream running?\n"
-        "/help — This message\n\n"
-        "*Output:* Any input → `1080x1920` 9:16 @ 8 Mbps\n"
-        "YouTube shows it as Full HD regardless of source quality.",
+        "*Stream from Google Drive:*\n"
+        "`/url <Drive share link>` — stream one video\n\n"
+        "*Playlist:*\n"
+        "`/playlist add <url>` — add to queue\n"
+        "`/playlist` — view queue\n"
+        "`/playlist remove <n>` — remove item\n"
+        "`/playlist clear` — clear all\n"
+        "`/playlist start` — stream all in order\n\n"
+        "*Other:*\n"
+        "`/stream` — how-to guide\n"
+        "`/status` — is a stream running?\n"
+        "`/help` — this message\n\n"
+        "*Upload directly:* just send a video/audio file here\n\n"
+        "*Output:* Any input → `1080x1920` 9:16 @ 8 Mbps",
         parse_mode="Markdown",
     )

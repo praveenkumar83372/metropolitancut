@@ -4,7 +4,7 @@ import logging
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from shortstream import (
     cmd_stream, cmd_status, cmd_help,
-    cmd_url,
+    cmd_url, cmd_playlist,
     handle_file,
     TELEGRAM_TOKEN,
 )
@@ -34,22 +34,22 @@ def main():
     )
 
     # Commands
-    app.add_handler(CommandHandler("stream", cmd_stream))
-    app.add_handler(CommandHandler("url",    cmd_url))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("stream",   cmd_stream))
+    app.add_handler(CommandHandler("url",      cmd_url))
+    app.add_handler(CommandHandler("playlist", cmd_playlist))
+    app.add_handler(CommandHandler("status",   cmd_status))
+    app.add_handler(CommandHandler("help",     cmd_help))
 
-    # Any video/audio/document sent directly — no command needed
+    # Direct file upload — no command needed
     app.add_handler(MessageHandler(
         filters.VIDEO
         | filters.AUDIO
         | filters.VOICE
-        | filters.Document.ALL,   # catch ALL documents so nothing slips through
+        | filters.Document.ALL,
         handle_file,
     ))
 
-    logger.info("✅ Bot ready — just send a video/audio file to start streaming!")
-
+    logger.info("✅ Bot ready!")
     app.run_polling(
         drop_pending_updates=True,
         close_loop=True,
