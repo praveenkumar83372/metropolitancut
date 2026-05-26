@@ -41,8 +41,4 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           YOUTUBE_STREAM_URL: ${{ secrets.YOUTUBE_STREAM_URL }}
-          # Add a residential proxy to bypass YouTube's datacenter IP block.
-          # Format: http://user:pass@host:port  or  socks5://user:pass@host:port
-          # Free residential proxies: https://webshare.io (10 free residential IPs)
-          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python bot_runner.py

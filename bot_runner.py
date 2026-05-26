@@ -1,12 +1,16 @@
 import os
 import time
 import logging
-from telegram.ext import Application, CommandHandler
-from shortstream import cmd_stream, cmd_status, cmd_help, TELEGRAM_TOKEN
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from shortstream import (
+    cmd_stream, cmd_status, cmd_help,
+    handle_file,
+    TELEGRAM_TOKEN,
+)
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
@@ -23,16 +27,30 @@ def main():
         .token(TELEGRAM_TOKEN)
         .connect_timeout(30.0)
         .read_timeout(30.0)
-        .write_timeout(30.0)
+        .write_timeout(120.0)   # longer write timeout for large file downloads
         .pool_timeout(30.0)
         .build()
     )
 
+    # Commands
     app.add_handler(CommandHandler("stream", cmd_stream))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help",   cmd_help))
 
-    logger.info("✅ Bot online — waiting for /stream commands...")
+    # File uploads — video, audio, document, voice
+    app.add_handler(MessageHandler(
+        filters.VIDEO | filters.AUDIO | filters.VOICE |
+        filters.Document.VIDEO | filters.Document.AUDIO |
+        filters.Document.MimeType("video/mp4") |
+        filters.Document.MimeType("video/x-matroska") |
+        filters.Document.MimeType("video/quicktime") |
+        filters.Document.MimeType("audio/mpeg") |
+        filters.Document.MimeType("audio/mp4") |
+        filters.Document.MimeType("audio/x-m4a"),
+        handle_file,
+    ))
+
+    logger.info("✅ Bot online — send a video/audio file or use /stream <url>")
 
     app.run_polling(
         drop_pending_updates=True,
