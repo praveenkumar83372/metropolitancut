@@ -115,6 +115,10 @@ def is_valid_video(file_path: str) -> bool:
         return False
 
 
+# ─────────────────────────────────────────────────────────────────
+# DOWNLOAD  —  handles Google Drive virus-scan redirect
+# ─────────────────────────────────────────────────────────────────
+
 async def _download_url(url: str, dest: str, message: Message) -> bool:
     import urllib.request
 
@@ -125,31 +129,105 @@ async def _download_url(url: str, dest: str, message: Message) -> bool:
             parse_mode="Markdown",
         )
         download_url = gdrive_direct
+        is_gdrive = True
     else:
         download_url = url
+        is_gdrive = False
 
     loop = asyncio.get_event_loop()
 
     def _dl(u, d):
-        req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=300) as resp, open(d, "wb") as out:
-            while True:
-                chunk = resp.read(1024 * 1024)
-                if not chunk:
-                    break
-                out.write(chunk)
+        import http.cookiejar
+
+        # Cookie jar keeps Google's virus-scan confirmation cookie
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        opener.addheaders = [("User-Agent", "Mozilla/5.0")]
+
+        req = urllib.request.Request(u)
+        with opener.open(req, timeout=300) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+
+            # Google serves an HTML warning page for large files
+            if "text/html" in content_type and is_gdrive:
+                raw = resp.read(1024 * 50)
+                decoded = raw.decode(errors="ignore")
+
+                confirm_match = re.search(r'confirm=([0-9A-Za-z_\-]+)', decoded)
+                uuid_match    = re.search(r'uuid=([0-9A-Za-z_\-]+)',    decoded)
+
+                if confirm_match:
+                    file_id = extract_gdrive_id(u)
+                    confirm = confirm_match.group(1)
+                    uuid    = uuid_match.group(1) if uuid_match else ""
+                    new_url = (
+                        f"https://drive.google.com/uc?export=download"
+                        f"&id={file_id}&confirm={confirm}"
+                        + (f"&uuid={uuid}" if uuid else "")
+                    )
+                    req2 = urllib.request.Request(new_url)
+                    with opener.open(req2, timeout=300) as resp2:
+                        with open(d, "wb") as out:
+                            while True:
+                                chunk = resp2.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                out.write(chunk)
+                    return  # success via confirm token
+
+                # Small file — served directly despite HTML content-type guess
+                with open(d, "wb") as out:
+                    out.write(raw)
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                return
+
+            # Normal binary download
+            with open(d, "wb") as out:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
 
     try:
         await loop.run_in_executor(None, _dl, download_url, dest)
+
+        # Sanity check — if we got HTML the download was blocked
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            with open(dest, "rb") as f:
+                header = f.read(512)
+            if b"<!DOCTYPE" in header or b"<html" in header.lower():
+                os.remove(dest)
+                await message.reply_text(
+                    "❌ *Google Drive returned an HTML page instead of the video.*\n\n"
+                    "This usually means the file is not shared publicly.\n\n"
+                    "Fix:\n"
+                    "1. Open Google Drive\n"
+                    "2. Right-click the file → *Share*\n"
+                    "3. Change to *'Anyone with the link'*\n"
+                    "4. Copy the link and paste here again.",
+                    parse_mode="Markdown",
+                )
+                return False
+
         return True
+
     except Exception as e:
         await message.reply_text(
             f"❌ Download failed:\n`{e}`\n\n"
-            "For Google Drive: make sure the file is shared as *'Anyone with the link'*.",
+            "Make sure the file is shared as *'Anyone with the link'* in Google Drive.",
             parse_mode="Markdown",
         )
         return False
 
+
+# ─────────────────────────────────────────────────────────────────
+# CORE STREAM LOGIC
+# ─────────────────────────────────────────────────────────────────
 
 async def _do_stream(message: Message, file_path: str):
     loop = asyncio.get_event_loop()
@@ -157,7 +235,7 @@ async def _do_stream(message: Message, file_path: str):
     if not is_valid_video(file_path):
         await message.reply_text(
             "❌ File doesn't appear to be a valid video/audio file.\n"
-            "Please send an `.mp4`, `.mkv`, `.mov`, `.mp3`, `.m4a` etc."
+            "Supported: `.mp4`, `.mkv`, `.mov`, `.mp3`, `.m4a` etc."
         )
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -225,26 +303,22 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tg_file:
         await msg.reply_text(
             "❓ I didn't receive a media file.\n\n"
-            "Please send your video/audio file directly in this chat.\n"
-            "Don't use any command — just attach and send the file."
+            "Send a video/audio file directly, or paste a Google Drive link."
         )
         return
 
     file_size_mb = getattr(tg_file, "file_size", 0) / (1024 * 1024)
-    file_name = getattr(tg_file, "file_name", "uploaded file")
+    file_name    = getattr(tg_file, "file_name", "uploaded file")
 
     if file_size_mb > 2000:
         await msg.reply_text(
             f"❌ File too large ({file_size_mb:.0f} MB).\n"
-            "Telegram bots can handle up to ~2 GB.\n"
-            "For bigger files use: `/url <direct_download_link>`",
+            "Upload to Google Drive and paste the link here instead.",
             parse_mode="Markdown",
         )
         return
 
     async with _stream_lock:
-        loop = asyncio.get_event_loop()
-
         await msg.reply_text(
             f"📥 *Downloading your file...*\n\n"
             f"📎 `{file_name}`\n"
@@ -281,9 +355,15 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     os.rename(wrapped, LOCAL_FILE)
                 else:
                     err = r.stderr.decode(errors="ignore")[-300:]
-                    await msg.reply_text(f"⚠️ Audio wrap failed:\n`{err}`\nTrying direct stream...", parse_mode="Markdown")
+                    await msg.reply_text(
+                        f"⚠️ Audio wrap failed:\n`{err}`\nTrying direct stream...",
+                        parse_mode="Markdown",
+                    )
             except Exception as e:
-                await msg.reply_text(f"⚠️ Audio wrap error: `{e}` — trying direct stream...", parse_mode="Markdown")
+                await msg.reply_text(
+                    f"⚠️ Audio wrap error: `{e}` — trying direct stream...",
+                    parse_mode="Markdown",
+                )
 
         await _do_stream(msg, LOCAL_FILE)
 
@@ -298,7 +378,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text.startswith(("http://", "https://")):
         await update.message.reply_text(
             "❓ I only understand URLs or file uploads.\n\n"
-            "Paste a Google Drive link, use `/url <link>`, or just upload a file directly.",
+            "Paste a Google Drive link, use `/url <link>`, or upload a file directly.",
             parse_mode="Markdown",
         )
         return
@@ -340,7 +420,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────
-# /url  —  stream a single URL
+# /url  —  stream a single URL via command
 # ─────────────────────────────────────────────────────────────────
 
 async def cmd_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -524,7 +604,7 @@ async def cmd_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *How to stream:*\n\n"
-        "🔗 *Paste a Google Drive link directly in chat* — just send the URL, no command needed!\n\n"
+        "🔗 *Paste a Google Drive link directly in chat* — no command needed!\n\n"
         "🎬 *Single video via command:*\n"
         "`/url <Google Drive or direct link>`\n\n"
         "📋 *Playlist (multiple videos):*\n"
@@ -552,7 +632,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎥 *Metropolitan Shorts Live Bot*\n\n"
-        "*Easiest way — just paste a Google Drive link in chat!*\n\n"
+        "*Easiest — just paste a Google Drive link in chat!*\n\n"
         "*Commands:*\n"
         "`/url <link>` — stream one video\n"
         "`/playlist add <url>` — add to queue\n"
