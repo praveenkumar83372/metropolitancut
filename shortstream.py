@@ -116,87 +116,61 @@ def is_valid_video(file_path: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────
-# DOWNLOAD  —  handles Google Drive virus-scan redirect
+# DOWNLOAD  —  gdown for Google Drive, urllib for everything else
 # ─────────────────────────────────────────────────────────────────
 
 async def _download_url(url: str, dest: str, message: Message) -> bool:
     import urllib.request
 
-    gdrive_direct = make_gdrive_direct(url)
-    if gdrive_direct:
+    is_gdrive = "drive.google.com" in url or "docs.google.com" in url
+
+    if is_gdrive:
         await message.reply_text(
-            "☁️ *Google Drive link detected — converting to direct download...*",
+            "☁️ *Google Drive link detected — downloading via gdown...*",
             parse_mode="Markdown",
         )
-        download_url = gdrive_direct
-        is_gdrive = True
+        file_id = extract_gdrive_id(url)
+        if not file_id:
+            await message.reply_text("❌ Could not extract Google Drive file ID from the link.")
+            return False
+        download_url = f"https://drive.google.com/uc?id={file_id}"
     else:
         download_url = url
-        is_gdrive = False
 
     loop = asyncio.get_event_loop()
 
-    def _dl(u, d):
-        import http.cookiejar
-
-        # Cookie jar keeps Google's virus-scan confirmation cookie
-        cj = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-        opener.addheaders = [("User-Agent", "Mozilla/5.0")]
-
-        req = urllib.request.Request(u)
-        with opener.open(req, timeout=300) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-
-            # Google serves an HTML warning page for large files
-            if "text/html" in content_type and is_gdrive:
-                raw = resp.read(1024 * 50)
-                decoded = raw.decode(errors="ignore")
-
-                confirm_match = re.search(r'confirm=([0-9A-Za-z_\-]+)', decoded)
-                uuid_match    = re.search(r'uuid=([0-9A-Za-z_\-]+)',    decoded)
-
-                if confirm_match:
-                    file_id = extract_gdrive_id(u)
-                    confirm = confirm_match.group(1)
-                    uuid    = uuid_match.group(1) if uuid_match else ""
-                    new_url = (
-                        f"https://drive.google.com/uc?export=download"
-                        f"&id={file_id}&confirm={confirm}"
-                        + (f"&uuid={uuid}" if uuid else "")
-                    )
-                    req2 = urllib.request.Request(new_url)
-                    with opener.open(req2, timeout=300) as resp2:
-                        with open(d, "wb") as out:
-                            while True:
-                                chunk = resp2.read(1024 * 1024)
-                                if not chunk:
-                                    break
-                                out.write(chunk)
-                    return  # success via confirm token
-
-                # Small file — served directly despite HTML content-type guess
-                with open(d, "wb") as out:
-                    out.write(raw)
-                    while True:
-                        chunk = resp.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                return
-
-            # Normal binary download
-            with open(d, "wb") as out:
+    def _dl():
+        if is_gdrive:
+            result = subprocess.run(
+                ["gdown", "--fuzzy", "-O", dest, download_url],
+                capture_output=True, text=True,
+            )
+            return result.returncode == 0, result.stderr + result.stdout
+        else:
+            req = urllib.request.Request(
+                download_url, headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=300) as resp, \
+                 open(dest, "wb") as out:
                 while True:
                     chunk = resp.read(1024 * 1024)
                     if not chunk:
                         break
                     out.write(chunk)
+            return True, ""
 
     try:
-        await loop.run_in_executor(None, _dl, download_url, dest)
+        ok, err = await loop.run_in_executor(None, _dl)
 
-        # Sanity check — if we got HTML the download was blocked
+        if not ok:
+            await message.reply_text(
+                f"❌ gdown failed:\n`{err[-400:]}`\n\n"
+                "Make sure the file is shared as *'Anyone with the link'* in Google Drive.",
+                parse_mode="Markdown",
+            )
+            return False
+
+        # Sanity check — make sure we didn't get an HTML error page
         if os.path.exists(dest) and os.path.getsize(dest) > 0:
             with open(dest, "rb") as f:
                 header = f.read(512)
@@ -204,12 +178,8 @@ async def _download_url(url: str, dest: str, message: Message) -> bool:
                 os.remove(dest)
                 await message.reply_text(
                     "❌ *Google Drive returned an HTML page instead of the video.*\n\n"
-                    "This usually means the file is not shared publicly.\n\n"
-                    "Fix:\n"
-                    "1. Open Google Drive\n"
-                    "2. Right-click the file → *Share*\n"
-                    "3. Change to *'Anyone with the link'*\n"
-                    "4. Copy the link and paste here again.",
+                    "This means Google is blocking the download from this server.\n\n"
+                    "Alternative: download the video to your phone and send the file directly here.",
                     parse_mode="Markdown",
                 )
                 return False
@@ -218,8 +188,7 @@ async def _download_url(url: str, dest: str, message: Message) -> bool:
 
     except Exception as e:
         await message.reply_text(
-            f"❌ Download failed:\n`{e}`\n\n"
-            "Make sure the file is shared as *'Anyone with the link'* in Google Drive.",
+            f"❌ Download failed:\n`{e}`",
             parse_mode="Markdown",
         )
         return False
@@ -333,7 +302,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tg_file_obj = await context.bot.get_file(tg_file.file_id)
             await tg_file_obj.download_to_drive(LOCAL_FILE)
         except Exception as e:
-            await msg.reply_text(f"❌ Download from Telegram failed:\n`{e}`", parse_mode="Markdown")
+            await msg.reply_text(
+                f"❌ Download from Telegram failed:\n`{e}`",
+                parse_mode="Markdown",
+            )
             return
 
         if is_audio_only:
@@ -505,7 +477,9 @@ async def cmd_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if sub == "add":
         if len(args) < 2:
-            await update.message.reply_text("Usage: `/playlist add <url>`", parse_mode="Markdown")
+            await update.message.reply_text(
+                "Usage: `/playlist add <url>`", parse_mode="Markdown"
+            )
             return
         url = args[1]
         if not url.startswith(("http://", "https://")):
@@ -526,14 +500,18 @@ async def cmd_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if sub == "remove":
         if len(args) < 2 or not args[1].isdigit():
-            await update.message.reply_text("Usage: `/playlist remove <number>`", parse_mode="Markdown")
+            await update.message.reply_text(
+                "Usage: `/playlist remove <number>`", parse_mode="Markdown"
+            )
             return
         idx = int(args[1]) - 1
         if idx < 0 or idx >= len(_playlist):
             await update.message.reply_text("❌ Invalid item number.")
             return
         removed = _playlist.pop(idx)
-        await update.message.reply_text(f"🗑 Removed: `{removed['label']}`", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🗑 Removed: `{removed['label']}`", parse_mode="Markdown"
+        )
         return
 
     if sub == "clear":
@@ -571,7 +549,9 @@ async def cmd_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 ok = await _download_url(item["url"], LOCAL_FILE, update.message)
                 if not ok:
-                    await update.message.reply_text(f"⏭ Skipping item {i} due to download error.")
+                    await update.message.reply_text(
+                        f"⏭ Skipping item {i} due to download error."
+                    )
                     continue
 
                 if not os.path.exists(LOCAL_FILE) or os.path.getsize(LOCAL_FILE) == 0:
