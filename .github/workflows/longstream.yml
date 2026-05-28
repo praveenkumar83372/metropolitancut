@@ -1,10 +1,10 @@
-name: Metropolitan Shorts Live
+name: Metropolitan Landscape Live
 
 on:
   workflow_dispatch:
 
 jobs:
-  shorts-live:
+  landscape-live:
     runs-on: ubuntu-latest
 
     timeout-minutes: 355
@@ -61,8 +61,6 @@ jobs:
 
       - name: Optimize Linux Network Buffers
         run: |
-
-          # Better livestream socket buffering
           sudo sysctl -w net.core.rmem_max=16777216
           sudo sysctl -w net.core.wmem_max=16777216
 
@@ -76,7 +74,7 @@ jobs:
       - name: Keep-alive heartbeat
         run: |
           while true; do
-            echo "⏳ $(date '+%H:%M:%S') — livestream worker active..."
+            echo "⏳ $(date '+%H:%M:%S') — landscape worker active..."
             sleep 240
           done &
 
@@ -84,11 +82,10 @@ jobs:
       # RUN BOT
       # ─────────────────────────────────────────────
 
-      - name: Run Shorts Live Bot
-
+      - name: Run Landscape Live Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          YOUTUBE_STREAM_URL: ${{ secrets.YOUTUBE_STREAM_URL }}
+          YOUTUBE_STREAM_URL:  ${{ secrets.YOUTUBE_STREAM_URL }}
 
           # FFmpeg stability
           FFMPEG_THREADS: 2
@@ -97,9 +94,7 @@ jobs:
           PYTHONUNBUFFERED: 1
 
         run: |
-
-          echo "🚀 Starting Metropolitan Shorts Live Engine..."
-
+          echo "🚀 Starting Metropolitan Landscape Live Engine..."
           python bot_runner.py
 
       # ─────────────────────────────────────────────
@@ -110,21 +105,20 @@ jobs:
         if: always()
 
         run: |
+          if [ -f "stream_state_h.txt" ]; then
 
-          if [ -f "stream_state.txt" ]; then
-
-            echo "🔄 Resume checkpoint found."
+            echo "🔄 Landscape resume checkpoint found."
             echo "🚀 Deploying fresh GitHub runner..."
 
             curl -X POST \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
-              https://api.github.com/repos/${{ github.repository }}/actions/workflows/shortstream.yml/dispatches \
+              https://api.github.com/repos/${{ github.repository }}/actions/workflows/longstream.yml/dispatches \
               -d '{"ref":"main"}'
 
           else
 
-            echo "✅ Stream completed normally."
+            echo "✅ Landscape stream completed normally."
             echo "🛑 No restart required."
 
           fi

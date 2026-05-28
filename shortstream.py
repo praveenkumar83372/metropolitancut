@@ -3,27 +3,86 @@ import re
 import subprocess
 import logging
 import asyncio
+import time
+
 from dotenv import load_dotenv
 from telegram import Update, Message
 from telegram.ext import ContextTypes
 
 load_dotenv()
 
+# ─────────────────────────────────────────────────────────────
+# ENV
+# ─────────────────────────────────────────────────────────────
+
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN")
 YOUTUBE_STREAM_URL = os.getenv("YOUTUBE_STREAM_URL")
 
 LOCAL_FILE = "stream_input.mp4"
+STATE_FILE = "stream_state.txt"
+URL_FILE   = "source_url.txt"
 
 logger = logging.getLogger(__name__)
+
 _stream_lock = asyncio.Lock()
 
-# In-memory playlist
-_playlist: list[dict] = []
+# ─────────────────────────────────────────────────────────────
+# STATE MANAGEMENT
+# ─────────────────────────────────────────────────────────────
+
+def load_state() -> float:
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return float(f.read().strip())
+        except Exception as e:
+            logger.error(f"State read error: {e}")
+    return 0.0
 
 
-# ─────────────────────────────────────────────────────────────────
+def save_state(seek_time: float):
+    try:
+        with open(STATE_FILE, "w") as f:
+            f.write(str(seek_time))
+        logger.info(f"💾 Saved stream state at {seek_time}s")
+
+        subprocess.run(["git", "config", "--global", "user.name",  "ShortsBotWorker"])
+        subprocess.run(["git", "config", "--global", "user.email", "bot@worker.com"])
+        subprocess.run(["git", "add", STATE_FILE])
+
+        if os.path.exists(URL_FILE):
+            subprocess.run(["git", "add", URL_FILE])
+
+        subprocess.run(["git", "commit", "-m", f"checkpoint {seek_time}s [skip ci]"])
+        subprocess.run(["git", "push"])
+
+    except Exception as e:
+        logger.error(f"Failed saving state: {e}")
+
+
+def clear_state():
+    logger.info("🧼 Clearing stream states...")
+    try:
+        subprocess.run(["git", "config", "--global", "user.name",  "ShortsBotWorker"])
+        subprocess.run(["git", "config", "--global", "user.email", "bot@worker.com"])
+
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+            subprocess.run(["git", "rm", STATE_FILE])
+
+        if os.path.exists(URL_FILE):
+            os.remove(URL_FILE)
+            subprocess.run(["git", "rm", URL_FILE])
+
+        subprocess.run(["git", "commit", "-m", "cleanup stream state [skip ci]"])
+        subprocess.run(["git", "push"])
+
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
+
+# ─────────────────────────────────────────────────────────────
 # GOOGLE DRIVE
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 def extract_gdrive_id(url: str) -> str | None:
     patterns = [
@@ -37,77 +96,161 @@ def extract_gdrive_id(url: str) -> str | None:
             return m.group(1)
     return None
 
+# ─────────────────────────────────────────────────────────────
+# STREAM ENGINE  —  2K / Ultra-HD Shorts quality
+#
+# Target output : 1080 × 1920  (9:16 Shorts)
+# Effective res : 2× sharpness via lanczos + unsharp mask
+# Bitrate       : 8 Mbps video  (YouTube 1080p60 recommended)
+# Audio         : 192 k AAC stereo
+# Latency       : ultrafast preset + zerolatency tune
+# Timestamps    : +genpts prevents PTS gaps on resume seeks
+# ─────────────────────────────────────────────────────────────
 
-def make_gdrive_direct(url: str) -> str | None:
-    if "drive.google.com" not in url and "docs.google.com" not in url:
-        return None
-    file_id = extract_gdrive_id(url)
-    if not file_id:
-        return None
-    return f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+def stream_to_youtube(
+    file_path: str,
+    rtmp_destination: str,
+    start_offset: float = 0.0,
+) -> bool:
 
+    # ── Seek strategy ───────────────────────────────────────
+    # >300 s  →  fast pre-input keyframe seek (no full decode)
+    # ≤300 s  →  output-side seek (frame accurate)
+    pre_seek  = ["-ss", str(start_offset)] if start_offset > 300 else []
+    post_seek = ["-ss", str(start_offset)] if 0 < start_offset <= 300 else []
 
-# ─────────────────────────────────────────────────────────────────
-# STREAM  —  Any resolution → 1080×1920 9:16
-# ─────────────────────────────────────────────────────────────────
-
-def stream_to_youtube(file_path: str, rtmp_destination: str) -> bool:
     ffmpeg_cmd = [
-        "ffmpeg", "-re", "-i", file_path,
-        "-vf", (
+        "ffmpeg",
+
+        # ── Pre-input fast seek (large offsets only) ─────────
+        *pre_seek,
+
+        # ── Real-time pacing ────────────────────────────────
+        "-re",
+
+        # ── Input ───────────────────────────────────────────
+        "-i", file_path,
+
+        # ── Output-side accurate seek (short offsets only) ──
+        *post_seek,
+
+        # ── Use all available CPU threads ───────────────────
+        "-threads", "0",
+
+        # ────────────────────────────────────────────────────
+        # VIDEO FILTERS
+        #  1. Perfect 9:16 centre-crop (handles any AR source)
+        #  2. Upscale/downscale to 1080×1920 with Lanczos
+        #     (much sharper than bicubic for Shorts)
+        #  3. Light unsharp to crisp edges post-scale
+        #  4. Slight contrast + saturation lift
+        # ────────────────────────────────────────────────────
+        "-vf",
+        (
             "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,"
             "scale=1080:1920:flags=lanczos,"
-            "unsharp=5:5:0.8:3:3:0.4"
+            "unsharp=5:5:0.6:3:3:0.0,"
+            "eq=contrast=1.04:saturation=1.08"
         ),
-        "-c:v", "libx264", "-preset", "slow",
-        "-b:v", "8000k", "-maxrate", "9000k", "-bufsize", "18000k",
-        "-pix_fmt", "yuv420p", "-g", "60", "-keyint_min", "60",
-        "-sc_threshold", "0", "-r", "30",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-        "-f", "flv", rtmp_destination,
+
+        # ────────────────────────────────────────────────────
+        # VIDEO ENCODE
+        # ultrafast keeps real-time on weak shared runners.
+        # 8 Mbps sits in YouTube's "recommended" tier for
+        # 1080p Shorts → triggers 2K/HQ serve path.
+        # ────────────────────────────────────────────────────
+        "-c:v",        "libx264",
+        "-preset",     "ultrafast",
+        "-tune",       "zerolatency",
+        "-b:v",        "8000k",
+        "-maxrate",    "8500k",
+        "-bufsize",    "16000k",
+
+        # FPS
+        "-r",          "30",
+
+        # Pixel format
+        "-pix_fmt",    "yuv420p",
+
+        # YouTube-required keyframe interval (every 2 s at 30 fps)
+        "-g",          "60",
+        "-keyint_min", "60",
+        "-sc_threshold", "0",
+
+        # Profile / level
+        "-profile:v",  "high",
+        "-level",      "4.2",        # 4.2 supports 1080p30 HQ fully
+
+        # ────────────────────────────────────────────────────
+        # AUDIO  —  192 k for clean stereo, no quality loss
+        # ────────────────────────────────────────────────────
+        "-c:a",  "aac",
+        "-b:a",  "192k",
+        "-ar",   "44100",
+        "-ac",   "2",
+
+        # ────────────────────────────────────────────────────
+        # STABILITY / MUXER
+        # ────────────────────────────────────────────────────
+        "-max_muxing_queue_size", "4096",
+
+        # Re-generate timestamps at seek boundaries → no PTS gaps
+        "-fflags",    "+genpts",
+
+        # Low-latency FLV flags
+        "-flvflags",  "no_duration_filesize",
+
+        # Output
+        "-f",  "flv",
+        rtmp_destination,
     ]
-    logger.info("FFmpeg streaming started...")
-    result = subprocess.run(ffmpeg_cmd)
-    return result.returncode == 0
 
+    logger.info(f"🚀 2K Shorts stream starting at offset {start_offset}s")
 
-# ─────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────
+    process = subprocess.Popen(
+        ffmpeg_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        universal_newlines=True,
+    )
 
-def get_video_info(file_path: str) -> dict:
-    info = {"duration": "unknown", "size": "unknown", "resolution": "unknown"}
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error",
-             "-show_entries", "format=duration:stream=width,height",
-             "-of", "default=noprint_wrappers=1", file_path],
-            capture_output=True, text=True, timeout=15,
-        )
-        for line in r.stdout.splitlines():
-            if line.startswith("duration="):
-                secs = float(line.split("=")[1])
-                h, rem = divmod(int(secs), 3600)
-                m, s = divmod(rem, 60)
-                info["duration"] = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
-            if line.startswith("width="):
-                info["w"] = line.split("=")[1]
-            if line.startswith("height="):
-                info["h"] = line.split("=")[1]
-        if "w" in info and "h" in info:
-            info["resolution"] = f"{info['w']}x{info['h']}"
-        size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        info["size"] = f"{size_mb:.1f} MB"
-    except Exception:
-        pass
-    return info
+    start_run_time       = time.time()
+    max_allowable_runtime = 20700          # ~5 h 45 m — safe GitHub limit
 
+    while True:
+        line = process.stdout.readline()
+        if line:
+            logger.info(line.strip())
+        if not line and process.poll() is not None:
+            break
+
+        elapsed = time.time() - start_run_time
+        if elapsed >= max_allowable_runtime:
+            logger.warning("⚠️ GitHub runtime limit approaching — saving checkpoint…")
+            process.terminate()
+            save_state(start_offset + elapsed)
+            return False
+
+    if process.returncode == 0:
+        clear_state()
+        return True
+
+    return False
+
+# ─────────────────────────────────────────────────────────────
+# VIDEO VALIDATION
+# ─────────────────────────────────────────────────────────────
 
 def is_valid_video(file_path: str) -> bool:
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries",
-             "format=duration", "-of", "default=noprint_wrappers=1", file_path],
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1",
+                file_path,
+            ],
             capture_output=True, text=True, timeout=15,
         )
         return "duration=" in r.stdout
@@ -115,9 +258,40 @@ def is_valid_video(file_path: str) -> bool:
         return False
 
 
-# ─────────────────────────────────────────────────────────────────
-# DOWNLOAD  —  gdown for Google Drive, urllib for everything else
-# ─────────────────────────────────────────────────────────────────
+def get_video_info(file_path: str) -> dict:
+    info = {"duration": "unknown", "size": "unknown", "resolution": "unknown"}
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration:stream=width,height",
+                "-of", "default=noprint_wrappers=1",
+                file_path,
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        for line in r.stdout.splitlines():
+            if line.startswith("duration="):
+                secs = float(line.split("=")[1])
+                h, rem = divmod(int(secs), 3600)
+                m, s   = divmod(rem, 60)
+                info["duration"] = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+            if line.startswith("width="):
+                info["w"] = line.split("=")[1]
+            if line.startswith("height="):
+                info["h"] = line.split("=")[1]
+
+        if "w" in info and "h" in info:
+            info["resolution"] = f"{info['w']}x{info['h']}"
+
+        info["size"] = f"{os.path.getsize(file_path) / (1024*1024):.1f} MB"
+    except Exception:
+        pass
+    return info
+
+# ─────────────────────────────────────────────────────────────
+# DOWNLOAD ENGINE
+# ─────────────────────────────────────────────────────────────
 
 async def _download_url(url: str, dest: str, message: Message) -> bool:
     import urllib.request
@@ -125,13 +299,10 @@ async def _download_url(url: str, dest: str, message: Message) -> bool:
     is_gdrive = "drive.google.com" in url or "docs.google.com" in url
 
     if is_gdrive:
-        await message.reply_text(
-            "☁️ *Google Drive link detected — downloading via gdown...*",
-            parse_mode="Markdown",
-        )
+        await message.reply_text("☁️ Downloading Google Drive video…")
         file_id = extract_gdrive_id(url)
         if not file_id:
-            await message.reply_text("❌ Could not extract Google Drive file ID from the link.")
+            await message.reply_text("❌ Invalid Google Drive link.")
             return False
         gdrive_url = f"https://drive.google.com/uc?id={file_id}"
     else:
@@ -145,483 +316,177 @@ async def _download_url(url: str, dest: str, message: Message) -> bool:
                 ["gdown", gdrive_url, "-O", dest],
                 capture_output=True, text=True,
             )
-            return result.returncode == 0, result.stderr + result.stdout
+            return result.returncode == 0
         else:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=300) as resp, \
-                 open(dest, "wb") as out:
+            with urllib.request.urlopen(req, timeout=300) as resp, open(dest, "wb") as out:
                 while True:
                     chunk = resp.read(1024 * 1024)
                     if not chunk:
                         break
                     out.write(chunk)
-            return True, ""
+            return True
 
     try:
-        ok, err = await loop.run_in_executor(None, _dl)
-
+        ok = await loop.run_in_executor(None, _dl)
         if not ok:
-            await message.reply_text(
-                f"❌ gdown failed:\n`{err[-400:]}`\n\n"
-                "Make sure the file is shared as *'Anyone with the link'* in Google Drive.",
-                parse_mode="Markdown",
-            )
+            await message.reply_text("❌ Download failed.")
             return False
-
-        # Sanity check — make sure we didn't get an HTML error page
-        if os.path.exists(dest) and os.path.getsize(dest) > 0:
-            with open(dest, "rb") as f:
-                header = f.read(512)
-            if b"<!DOCTYPE" in header or b"<html" in header.lower():
-                os.remove(dest)
-                await message.reply_text(
-                    "❌ *Google Drive returned an HTML page instead of the video.*\n\n"
-                    "Google is blocking the download from this server.\n\n"
-                    "Alternative: download the video to your phone and send the file directly here.",
-                    parse_mode="Markdown",
-                )
-                return False
-
         return True
-
     except Exception as e:
-        await message.reply_text(
-            f"❌ Download failed:\n`{e}`",
-            parse_mode="Markdown",
-        )
+        await message.reply_text(f"❌ Download failed:\n`{e}`", parse_mode="Markdown")
         return False
 
+# ─────────────────────────────────────────────────────────────
+# AUTO RESUME
+# ─────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────
-# CORE STREAM LOGIC
-# ─────────────────────────────────────────────────────────────────
+async def check_and_resume_stream(bot):
+    seek_time = load_state()
+    if seek_time > 0.0 and os.path.exists(URL_FILE):
+        try:
+            with open(URL_FILE, "r") as f:
+                saved_url = f.read().strip()
+            logger.info(f"🔄 Resume checkpoint found at {seek_time}s")
 
-async def _do_stream(message: Message, file_path: str):
+            gdrive_id = extract_gdrive_id(saved_url)
+            dl_res = subprocess.run(
+                ["gdown", f"https://drive.google.com/uc?id={gdrive_id}", "-O", LOCAL_FILE],
+                capture_output=True,
+            )
+            if dl_res.returncode == 0 and os.path.exists(LOCAL_FILE):
+                stream_to_youtube(LOCAL_FILE, YOUTUBE_STREAM_URL, seek_time)
+        except Exception as e:
+            logger.error(f"Resume error: {e}")
+
+# ─────────────────────────────────────────────────────────────
+# MAIN STREAM WRAPPER
+# ─────────────────────────────────────────────────────────────
+
+async def _do_stream(message: Message, file_path: str, start_offset: float = 0.0):
     loop = asyncio.get_event_loop()
 
     if not is_valid_video(file_path):
-        await message.reply_text(
-            "❌ File doesn't appear to be a valid video/audio file.\n"
-            "Supported: `.mp4`, `.mkv`, `.mov`, `.mp3`, `.m4a` etc."
-        )
         if os.path.exists(file_path):
             os.remove(file_path)
+        await message.reply_text("❌ File is not a valid video.")
         return
 
     vinfo = get_video_info(file_path)
+
     await message.reply_text(
-        f"🎬 *File ready! Going LIVE...*\n\n"
+        f"🎬 *2K Shorts Stream Started!*\n\n"
         f"📐 Source: `{vinfo['resolution']}`\n"
-        f"📐 Output: `1080x1920` (9:16, upscaled)\n"
+        f"📐 Output: `1080×1920 (9:16)`\n"
+        f"🔥 Quality: `2K / Ultra-HD Shorts`\n"
+        f"📡 Bitrate: `8 Mbps`\n"
+        f"🎥 Codec: `H.264 High L4.2`\n"
+        f"🔊 Audio: `192 k AAC`\n"
         f"⏱ Duration: `{vinfo['duration']}`\n"
-        f"💾 Size: `{vinfo['size']}`",
+        f"💾 Size: `{vinfo['size']}`\n"
+        f"📍 Resume from: `{start_offset}s`",
         parse_mode="Markdown",
     )
 
     try:
-        stream_ok = await loop.run_in_executor(
-            None, stream_to_youtube, file_path, YOUTUBE_STREAM_URL
+        await loop.run_in_executor(
+            None,
+            stream_to_youtube,
+            file_path,
+            YOUTUBE_STREAM_URL,
+            start_offset,
         )
     except Exception as e:
         await message.reply_text(f"❌ Stream error:\n`{e}`", parse_mode="Markdown")
-        stream_ok = False
     finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        if os.path.exists(STATE_FILE):
+            logger.info("Checkpoint preserved — next runner will resume.")
+        else:
+            if os.path.exists(file_path):
+                os.remove(file_path)
 
-    if stream_ok:
-        await message.reply_text("✅ *Stream ended naturally.*", parse_mode="Markdown")
-    else:
-        await message.reply_text("⚠️ *Stream ended with an error.*", parse_mode="Markdown")
-
-
-# ─────────────────────────────────────────────────────────────────
-# FILE HANDLER  —  user sends a video/audio file directly
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# FILE HANDLER
+# ─────────────────────────────────────────────────────────────
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not YOUTUBE_STREAM_URL:
-        await update.message.reply_text("❌ YOUTUBE_STREAM_URL secret is missing.")
-        return
+    await update.message.reply_text(
+        "⚠️ Large Telegram uploads are unstable.\n"
+        "Please send a Google Drive link instead."
+    )
 
-    if _stream_lock.locked():
-        await update.message.reply_text("⚠️ A stream is already LIVE right now.")
-        return
-
-    msg = update.message
-    tg_file = None
-    is_audio_only = False
-
-    if msg.video:
-        tg_file = msg.video
-    elif msg.document:
-        mime = (msg.document.mime_type or "").lower()
-        name = (msg.document.file_name or "").lower()
-        tg_file = msg.document
-        if mime.startswith("audio/") or name.endswith((".mp3", ".m4a", ".aac", ".ogg", ".flac", ".wav")):
-            is_audio_only = True
-    elif msg.audio:
-        tg_file = msg.audio
-        is_audio_only = True
-    elif msg.voice:
-        tg_file = msg.voice
-        is_audio_only = True
-
-    if not tg_file:
-        await msg.reply_text(
-            "❓ I didn't receive a media file.\n\n"
-            "Send a video/audio file directly, or paste a Google Drive link."
-        )
-        return
-
-    file_size_mb = getattr(tg_file, "file_size", 0) / (1024 * 1024)
-    file_name    = getattr(tg_file, "file_name", "uploaded file")
-
-    if file_size_mb > 2000:
-        await msg.reply_text(
-            f"❌ File too large ({file_size_mb:.0f} MB).\n"
-            "Upload to Google Drive and paste the link here instead.",
-            parse_mode="Markdown",
-        )
-        return
-
-    async with _stream_lock:
-        await msg.reply_text(
-            f"📥 *Downloading your file...*\n\n"
-            f"📎 `{file_name}`\n"
-            f"💾 `{file_size_mb:.1f} MB`",
-            parse_mode="Markdown",
-        )
-
-        if os.path.exists(LOCAL_FILE):
-            os.remove(LOCAL_FILE)
-
-        try:
-            tg_file_obj = await context.bot.get_file(tg_file.file_id)
-            await tg_file_obj.download_to_drive(LOCAL_FILE)
-        except Exception as e:
-            await msg.reply_text(
-                f"❌ Download from Telegram failed:\n`{e}`",
-                parse_mode="Markdown",
-            )
-            return
-
-        if is_audio_only:
-            await msg.reply_text("🎵 Audio detected — adding black background for stream...")
-            wrapped = LOCAL_FILE + "_wrapped.mp4"
-            try:
-                r = subprocess.run([
-                    "ffmpeg", "-y",
-                    "-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=30",
-                    "-i", LOCAL_FILE,
-                    "-shortest",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
-                    "-c:a", "aac", "-b:a", "192k",
-                    "-pix_fmt", "yuv420p",
-                    wrapped,
-                ], capture_output=True, timeout=600)
-                if r.returncode == 0 and os.path.exists(wrapped):
-                    os.remove(LOCAL_FILE)
-                    os.rename(wrapped, LOCAL_FILE)
-                else:
-                    err = r.stderr.decode(errors="ignore")[-300:]
-                    await msg.reply_text(
-                        f"⚠️ Audio wrap failed:\n`{err}`\nTrying direct stream...",
-                        parse_mode="Markdown",
-                    )
-            except Exception as e:
-                await msg.reply_text(
-                    f"⚠️ Audio wrap error: `{e}` — trying direct stream...",
-                    parse_mode="Markdown",
-                )
-
-        await _do_stream(msg, LOCAL_FILE)
-
-
-# ─────────────────────────────────────────────────────────────────
-# PLAIN TEXT HANDLER  —  user pastes a URL directly in chat
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# TEXT URL HANDLER
+# ─────────────────────────────────────────────────────────────
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
-    if not text.startswith(("http://", "https://")):
-        await update.message.reply_text(
-            "❓ I only understand URLs or file uploads.\n\n"
-            "Paste a Google Drive link, use `/url <link>`, or upload a file directly.",
-            parse_mode="Markdown",
-        )
-        return
-
-    blocked = ("youtube.com", "youtu.be")
-    if any(b in text for b in blocked):
-        await update.message.reply_text(
-            "❌ YouTube URLs are not supported.\n"
-            "Download the video first, then send it here or upload to Google Drive."
-        )
+    if (
+        not text.startswith(("http://", "https://"))
+        or any(b in text for b in ("youtube.com", "youtu.be"))
+    ):
         return
 
     if not YOUTUBE_STREAM_URL:
-        await update.message.reply_text("❌ YOUTUBE_STREAM_URL secret is missing.")
+        await update.message.reply_text("❌ Missing YOUTUBE_STREAM_URL secret.")
         return
 
     if _stream_lock.locked():
-        await update.message.reply_text("⚠️ A stream is already LIVE right now.")
+        await update.message.reply_text("⏳ A stream is already running.")
         return
 
     async with _stream_lock:
-        await update.message.reply_text(
-            f"🔗 *URL detected — downloading...*\n\n`{text}`",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text("📥 Preparing 2K Shorts livestream…")
 
         if os.path.exists(LOCAL_FILE):
             os.remove(LOCAL_FILE)
+
+        with open(URL_FILE, "w") as f:
+            f.write(text)
 
         ok = await _download_url(text, LOCAL_FILE, update.message)
-        if not ok:
+
+        if not ok or not os.path.exists(LOCAL_FILE) or os.path.getsize(LOCAL_FILE) == 0:
             return
 
-        if not os.path.exists(LOCAL_FILE) or os.path.getsize(LOCAL_FILE) == 0:
-            await update.message.reply_text("❌ Downloaded file is empty.")
-            return
+        await _do_stream(update.message, LOCAL_FILE, 0.0)
 
-        await _do_stream(update.message, LOCAL_FILE)
-
-
-# ─────────────────────────────────────────────────────────────────
-# /url  —  stream a single URL via command
-# ─────────────────────────────────────────────────────────────────
-
-async def cmd_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not YOUTUBE_STREAM_URL:
-        await update.message.reply_text("❌ YOUTUBE_STREAM_URL secret is missing.")
-        return
-
-    if _stream_lock.locked():
-        await update.message.reply_text("⚠️ A stream is already LIVE right now.")
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: `/url <link>`\n\n"
-            "Supported:\n"
-            "• *Google Drive* share link\n"
-            "• *Dropbox*: change `?dl=0` → `?dl=1`\n"
-            "• *Direct link*: `https://yourserver.com/video.mp4`\n\n"
-            "⚠️ YouTube links won't work.",
-            parse_mode="Markdown",
-        )
-        return
-
-    raw_url = context.args[0]
-
-    blocked = ("youtube.com", "youtu.be", "youtube-nocookie.com")
-    if any(b in raw_url for b in blocked):
-        await update.message.reply_text(
-            "❌ YouTube URLs are not supported.\n"
-            "Download the video first, then send it here or upload to Google Drive."
-        )
-        return
-
-    if not raw_url.startswith(("http://", "https://")):
-        await update.message.reply_text("❌ Please provide a valid http/https URL.")
-        return
-
-    async with _stream_lock:
-        await update.message.reply_text(
-            f"📥 *Downloading...*\n\n`{raw_url}`",
-            parse_mode="Markdown",
-        )
-
-        if os.path.exists(LOCAL_FILE):
-            os.remove(LOCAL_FILE)
-
-        ok = await _download_url(raw_url, LOCAL_FILE, update.message)
-        if not ok:
-            return
-
-        if not os.path.exists(LOCAL_FILE) or os.path.getsize(LOCAL_FILE) == 0:
-            await update.message.reply_text("❌ Downloaded file is empty.")
-            return
-
-        await _do_stream(update.message, LOCAL_FILE)
-
-
-# ─────────────────────────────────────────────────────────────────
-# /playlist  —  queue of URLs
-# ─────────────────────────────────────────────────────────────────
-
-async def cmd_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global _playlist
-    args = context.args
-
-    if not args:
-        if not _playlist:
-            await update.message.reply_text(
-                "📋 *Playlist is empty.*\n\n"
-                "Add videos with:\n`/playlist add <Google Drive or direct URL>`",
-                parse_mode="Markdown",
-            )
-            return
-        lines = [f"📋 *Playlist ({len(_playlist)} items):*\n"]
-        for i, item in enumerate(_playlist, 1):
-            lines.append(f"{i}. {item['label']}")
-        lines.append("\nUse `/playlist start` to stream all in order.")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-        return
-
-    sub = args[0].lower()
-
-    if sub == "add":
-        if len(args) < 2:
-            await update.message.reply_text(
-                "Usage: `/playlist add <url>`", parse_mode="Markdown"
-            )
-            return
-        url = args[1]
-        if not url.startswith(("http://", "https://")):
-            await update.message.reply_text("❌ Invalid URL.")
-            return
-        blocked = ("youtube.com", "youtu.be")
-        if any(b in url for b in blocked):
-            await update.message.reply_text("❌ YouTube URLs are not supported.")
-            return
-        gdrive_id = extract_gdrive_id(url)
-        label = f"Drive:{gdrive_id[:12]}…" if gdrive_id else url[:60]
-        _playlist.append({"url": url, "label": label})
-        await update.message.reply_text(
-            f"✅ Added to playlist (#{len(_playlist)}):\n`{label}`",
-            parse_mode="Markdown",
-        )
-        return
-
-    if sub == "remove":
-        if len(args) < 2 or not args[1].isdigit():
-            await update.message.reply_text(
-                "Usage: `/playlist remove <number>`", parse_mode="Markdown"
-            )
-            return
-        idx = int(args[1]) - 1
-        if idx < 0 or idx >= len(_playlist):
-            await update.message.reply_text("❌ Invalid item number.")
-            return
-        removed = _playlist.pop(idx)
-        await update.message.reply_text(
-            f"🗑 Removed: `{removed['label']}`", parse_mode="Markdown"
-        )
-        return
-
-    if sub == "clear":
-        _playlist.clear()
-        await update.message.reply_text("🗑 Playlist cleared.")
-        return
-
-    if sub == "start":
-        if not YOUTUBE_STREAM_URL:
-            await update.message.reply_text("❌ YOUTUBE_STREAM_URL secret is missing.")
-            return
-        if _stream_lock.locked():
-            await update.message.reply_text("⚠️ A stream is already LIVE right now.")
-            return
-        if not _playlist:
-            await update.message.reply_text("📋 Playlist is empty. Add URLs first.")
-            return
-
-        total = len(_playlist)
-        await update.message.reply_text(
-            f"▶️ *Starting playlist — {total} video(s)...*",
-            parse_mode="Markdown",
-        )
-
-        async with _stream_lock:
-            items = list(_playlist)
-            for i, item in enumerate(items, 1):
-                await update.message.reply_text(
-                    f"🎬 *Playing {i}/{total}:*\n`{item['label']}`",
-                    parse_mode="Markdown",
-                )
-
-                if os.path.exists(LOCAL_FILE):
-                    os.remove(LOCAL_FILE)
-
-                ok = await _download_url(item["url"], LOCAL_FILE, update.message)
-                if not ok:
-                    await update.message.reply_text(
-                        f"⏭ Skipping item {i} due to download error."
-                    )
-                    continue
-
-                if not os.path.exists(LOCAL_FILE) or os.path.getsize(LOCAL_FILE) == 0:
-                    await update.message.reply_text(f"⏭ Skipping item {i} — empty file.")
-                    continue
-
-                await _do_stream(update.message, LOCAL_FILE)
-
-            await update.message.reply_text(
-                f"✅ *Playlist finished! All {total} video(s) streamed.*",
-                parse_mode="Markdown",
-            )
-        return
-
-    await update.message.reply_text(
-        "Unknown subcommand.\n\n"
-        "`/playlist` — show list\n"
-        "`/playlist add <url>` — add video\n"
-        "`/playlist remove <n>` — remove item\n"
-        "`/playlist clear` — clear all\n"
-        "`/playlist start` — stream all",
-        parse_mode="Markdown",
-    )
-
-
-# ─────────────────────────────────────────────────────────────────
-# COMMANDS
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# COMMANDS  (stubs — implement as needed)
+# ─────────────────────────────────────────────────────────────
 
 async def cmd_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *How to stream:*\n\n"
-        "🔗 *Paste a Google Drive link directly in chat* — no command needed!\n\n"
-        "🎬 *Single video via command:*\n"
-        "`/url <Google Drive or direct link>`\n\n"
-        "📋 *Playlist (multiple videos):*\n"
-        "`/playlist add <url>` — add to queue\n"
-        "`/playlist` — view queue\n"
-        "`/playlist start` — stream all in order\n\n"
-        "📁 *Upload directly:*\n"
-        "Just send a video/audio file here — no command needed.\n\n"
-        "❌ YouTube links won't work — download the video first.",
-        parse_mode="Markdown",
+        "📎 Send a Google Drive direct link to start streaming."
     )
 
-
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _stream_lock.locked():
-        status = "🔴 *Stream is currently LIVE.*"
+    seek = load_state()
+    if seek > 0.0:
+        await update.message.reply_text(f"🔄 Stream checkpoint found at `{seek}s`.", parse_mode="Markdown")
+    elif _stream_lock.locked():
+        await update.message.reply_text("📡 Stream is currently live.")
     else:
-        pl_count = len(_playlist)
-        status = "⚪ *No stream running.*"
-        if pl_count:
-            status += f"\n📋 Playlist has {pl_count} item(s) queued."
-    await update.message.reply_text(status, parse_mode="Markdown")
-
+        await update.message.reply_text("💤 No active stream.")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎥 *Metropolitan Shorts Live Bot*\n\n"
-        "*Easiest — just paste a Google Drive link in chat!*\n\n"
-        "*Commands:*\n"
-        "`/url <link>` — stream one video\n"
-        "`/playlist add <url>` — add to queue\n"
-        "`/playlist` — view queue\n"
-        "`/playlist remove <n>` — remove item\n"
-        "`/playlist clear` — clear all\n"
-        "`/playlist start` — stream all in order\n"
-        "`/stream` — how-to guide\n"
-        "`/status` — is a stream running?\n"
-        "`/help` — this message\n\n"
-        "*Upload directly:* just send a video/audio file here\n\n"
-        "*Output:* Any input → `1080x1920` 9:16 @ 8 Mbps",
+        "*Metropolitan Shorts Live Bot*\n\n"
+        "• Paste a Google Drive link → stream starts automatically\n"
+        "/stream — show this prompt\n"
+        "/status — check stream state\n"
+        "/help   — this message",
         parse_mode="Markdown",
     )
+
+async def cmd_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: treat args as a URL
+    if context.args:
+        update.message.text = context.args[0]
+        await handle_text(update, context)
+    else:
+        await update.message.reply_text("Usage: /url <google_drive_link>")
+
+async def cmd_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎵 Playlist feature coming soon.")

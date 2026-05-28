@@ -1,7 +1,0 @@
-{
-  "name": "metropolitan-shorts-bot",
-  "version": "1.0.0",
-  "dependencies": {
-    "youtube-po-token-generator": "latest"
-  }
-}
