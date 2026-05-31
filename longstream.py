@@ -102,6 +102,7 @@ def extract_gdrive_id_h(url: str) -> str | None:
 # Target output : 1920 × 1080  (16:9 standard)
 # Bitrate       : 8 Mbps video
 # Audio         : 192 k AAC stereo
+# Port 443 RTMPS : bypasses GitHub Actions firewall
 # ─────────────────────────────────────────────────────────────
 
 def stream_to_youtube_h(
@@ -127,7 +128,7 @@ def stream_to_youtube_h(
         # 3. Light sharpen + subtle contrast lift
         "-vf",
         (
-            "crop=iw:iw*9/16:(ih-iw*9/16)/2:0,"   # crop height to 16:9
+            "crop=iw:iw*9/16:(ih-iw*9/16)/2:0,"
             "scale=1920:1080:flags=lanczos,"
             "unsharp=5:5:0.5:3:3:0.0,"
             "eq=contrast=1.03:saturation=1.06"
@@ -154,10 +155,14 @@ def stream_to_youtube_h(
         "-ar",   "44100",
         "-ac",   "2",
 
-        # ── STABILITY ──────────────────────────────────────
+        # ── STABILITY / MUXER ──────────────────────────────
         "-max_muxing_queue_size", "4096",
         "-fflags",    "+genpts",
         "-flvflags",  "no_duration_filesize",
+
+        # RTMPS over port 443 — bypasses GitHub Actions firewall
+        "-tls_verify", "0",
+
         "-f",  "flv",
         rtmp_destination,
     ]
@@ -196,7 +201,7 @@ def stream_to_youtube_h(
     return False
 
 # ─────────────────────────────────────────────────────────────
-# VIDEO VALIDATION  (reused helpers)
+# VIDEO VALIDATION
 # ─────────────────────────────────────────────────────────────
 
 def is_valid_video_h(file_path: str) -> bool:
@@ -355,7 +360,7 @@ async def _do_stream_h(message: Message, file_path: str, start_offset: float = 0
                 os.remove(file_path)
 
 # ─────────────────────────────────────────────────────────────
-# /h COMMAND HANDLER  —  entry point from bot_runner
+# /h COMMAND HANDLER
 # ─────────────────────────────────────────────────────────────
 
 async def cmd_h(update: Update, context: ContextTypes.DEFAULT_TYPE):
