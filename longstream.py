@@ -97,12 +97,33 @@ def extract_gdrive_id_h(url: str) -> str | None:
     return None
 
 # ─────────────────────────────────────────────────────────────
+# AUDIO CHECK HELPER
+# ─────────────────────────────────────────────────────────────
+
+def has_audio_stream(file_path: str) -> bool:
+    """Returns True if the video file has at least one audio stream."""
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a",
+                "-show_entries", "stream=codec_type",
+                "-of", "default=noprint_wrappers=1",
+                file_path,
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        return "codec_type=audio" in r.stdout
+    except Exception:
+        return False
+
+# ─────────────────────────────────────────────────────────────
 # STREAM ENGINE  —  16:9 Landscape / YouTube Live
 #
 # Target output : 1920 × 1080  (16:9 standard)
 # Bitrate       : 8 Mbps video
 # Audio         : 192 k AAC stereo
-# Port 443 RTMPS : bypasses GitHub Actions firewall
+#                 Auto-generates silent audio if source has none
 # ─────────────────────────────────────────────────────────────
 
 def stream_to_youtube_h(
@@ -114,13 +135,44 @@ def stream_to_youtube_h(
     pre_seek  = ["-ss", str(start_offset)] if start_offset > 300 else []
     post_seek = ["-ss", str(start_offset)] if 0 < start_offset <= 300 else []
 
+    audio_has_stream = has_audio_stream(file_path)
+    logger.info(f"🔊 Audio stream detected: {audio_has_stream}")
+
+    if audio_has_stream:
+        # ── Source has audio — use it directly ─────────────
+        inputs        = [*pre_seek, "-re", "-i", file_path]
+        audio_mapping = ["-map", "0:v:0", "-map", "0:a:0"]
+        audio_encode  = [
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-ar",  "44100",
+            "-ac",  "2",
+        ]
+    else:
+        # ── No audio — inject silent AAC track ─────────────
+        logger.warning("⚠️ No audio stream found — injecting silent audio track")
+        inputs        = [
+            *pre_seek, "-re", "-i", file_path,
+            "-f", "lavfi", "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=44100",
+        ]
+        audio_mapping = ["-map", "0:v:0", "-map", "1:a:0"]
+        audio_encode  = [
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-ar",  "44100",
+            "-ac",  "2",
+            "-shortest",
+        ]
+
     ffmpeg_cmd = [
         "ffmpeg",
-        *pre_seek,
-        "-re",
-        "-i", file_path,
+        *inputs,
         *post_seek,
         "-threads", "0",
+
+        # ── STREAM MAPPING ─────────────────────────────────
+        *audio_mapping,
 
         # ── VIDEO FILTERS ──────────────────────────────────
         # 1. Centre-crop to 16:9
@@ -135,25 +187,22 @@ def stream_to_youtube_h(
         ),
 
         # ── VIDEO ENCODE ───────────────────────────────────
-        "-c:v",        "libx264",
-        "-preset",     "ultrafast",
-        "-tune",       "zerolatency",
-        "-b:v",        "8000k",
-        "-maxrate",    "8500k",
-        "-bufsize",    "16000k",
-        "-r",          "30",
-        "-pix_fmt",    "yuv420p",
-        "-g",          "60",
-        "-keyint_min", "60",
+        "-c:v",          "libx264",
+        "-preset",       "ultrafast",
+        "-tune",         "zerolatency",
+        "-b:v",          "8000k",
+        "-maxrate",      "8500k",
+        "-bufsize",      "16000k",
+        "-r",            "30",
+        "-pix_fmt",      "yuv420p",
+        "-g",            "60",
+        "-keyint_min",   "60",
         "-sc_threshold", "0",
-        "-profile:v",  "high",
-        "-level",      "4.2",
+        "-profile:v",    "high",
+        "-level",        "4.2",
 
-        # ── AUDIO ──────────────────────────────────────────
-        "-c:a",  "aac",
-        "-b:a",  "192k",
-        "-ar",   "44100",
-        "-ac",   "2",
+        # ── AUDIO ENCODE ───────────────────────────────────
+        *audio_encode,
 
         # ── STABILITY / MUXER ──────────────────────────────
         "-max_muxing_queue_size", "4096",
@@ -326,7 +375,8 @@ async def _do_stream_h(message: Message, file_path: str, start_offset: float = 0
         await message.reply_text("❌ File is not a valid video.")
         return
 
-    vinfo = get_video_info_h(file_path)
+    vinfo     = get_video_info_h(file_path)
+    has_audio = has_audio_stream(file_path)
 
     await message.reply_text(
         f"🎬 *Landscape Stream Started!*\n\n"
@@ -335,7 +385,7 @@ async def _do_stream_h(message: Message, file_path: str, start_offset: float = 0
         f"🔥 Quality: `Full HD Landscape`\n"
         f"📡 Bitrate: `8 Mbps`\n"
         f"🎥 Codec: `H.264 High L4.2`\n"
-        f"🔊 Audio: `192 k AAC`\n"
+        f"🔊 Audio: `{'192k AAC' if has_audio else 'Silent (injected)'}`\n"
         f"⏱ Duration: `{vinfo['duration']}`\n"
         f"💾 Size: `{vinfo['size']}`\n"
         f"📍 Resume from: `{start_offset}s`",
