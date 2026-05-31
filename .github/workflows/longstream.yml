@@ -37,10 +37,25 @@ jobs:
       - name: Install FFmpeg
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg netcat-openbsd
 
           echo "FFmpeg Version:"
           ffmpeg -version | head -1
+
+      # ─────────────────────────────────────────────
+      # TEST RTMP CONNECTIVITY
+      # ─────────────────────────────────────────────
+
+      - name: Test RTMP Port Connectivity
+        run: |
+          echo "Testing port 1935 (standard RTMP)..."
+          nc -zv -w 5 a.rtmp.youtube.com 1935 && echo "✅ PORT 1935 OPEN" || echo "❌ PORT 1935 BLOCKED"
+
+          echo "Testing port 443 (RTMPS)..."
+          nc -zv -w 5 a.rtmp.youtube.com 443 && echo "✅ PORT 443 OPEN" || echo "❌ PORT 443 BLOCKED"
+
+          echo "Testing port 80 (fallback)..."
+          nc -zv -w 5 a.rtmp.youtube.com 80 && echo "✅ PORT 80 OPEN" || echo "❌ PORT 80 BLOCKED"
 
       # ─────────────────────────────────────────────
       # PYTHON DEPENDENCIES
