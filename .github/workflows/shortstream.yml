@@ -6,8 +6,10 @@ on:
 jobs:
   shorts-live:
     runs-on: ubuntu-latest
-
     timeout-minutes: 355
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
 
@@ -16,7 +18,7 @@ jobs:
       # ─────────────────────────────────────────────
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -25,7 +27,7 @@ jobs:
       # ─────────────────────────────────────────────
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.3.0
         with:
           python-version: "3.11"
           cache: "pip"
@@ -38,7 +40,6 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
-
           echo "FFmpeg Version:"
           ffmpeg -version | head -1
 
@@ -49,10 +50,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-
           pip install -r requirements.txt
-
-          # Google Drive downloader
           pip install gdown==4.7.3
 
       # ─────────────────────────────────────────────
@@ -61,11 +59,8 @@ jobs:
 
       - name: Optimize Linux Network Buffers
         run: |
-
-          # Better livestream socket buffering
           sudo sysctl -w net.core.rmem_max=16777216
           sudo sysctl -w net.core.wmem_max=16777216
-
           sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216"
           sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216"
 
@@ -85,21 +80,13 @@ jobs:
       # ─────────────────────────────────────────────
 
       - name: Run Shorts Live Bot
-
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          YOUTUBE_STREAM_URL: ${{ secrets.YOUTUBE_STREAM_URL }}
-
-          # FFmpeg stability
+          YOUTUBE_STREAM_URL:  ${{ secrets.YOUTUBE_STREAM_URL }}
           FFMPEG_THREADS: 2
-
-          # Prevent buffering stalls
           PYTHONUNBUFFERED: 1
-
         run: |
-
           echo "🚀 Starting Metropolitan Shorts Live Engine..."
-
           python bot_runner.py
 
       # ─────────────────────────────────────────────
@@ -108,23 +95,16 @@ jobs:
 
       - name: Check for Stream Resume Handoff
         if: always()
-
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-
           if [ -f "stream_state.txt" ]; then
-
             echo "🔄 Resume checkpoint found."
             echo "🚀 Deploying fresh GitHub runner..."
 
-            curl -X POST \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              https://api.github.com/repos/${{ github.repository }}/actions/workflows/shortstream.yml/dispatches \
-              -d '{"ref":"main"}'
+            gh workflow run shortstream.yml --ref main
 
           else
-
             echo "✅ Stream completed normally."
             echo "🛑 No restart required."
-
           fi
